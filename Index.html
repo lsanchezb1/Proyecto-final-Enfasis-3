@@ -1,0 +1,1010 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SDN Controller Interface</title>
+    <style>
+        :root {
+            --primary-color: #4a6da7;
+            --secondary-color: #304878;
+            --accent-color: #ff7700;
+            --light-color: #f5f5f5;
+            --dark-color: #333;
+            --error-color: #e74c3c;
+            --success-color: #2ecc71;
+        }
+       
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 0;
+            background-color: #f0f2f5;
+            color: var(--dark-color);
+        }
+       
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+       
+        header {
+            background-color: var(--primary-color);
+            color: white;
+            padding: 1rem;
+            text-align: center;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+       
+        header h1 {
+            margin: 0;
+        }
+       
+        .network-topology {
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+       
+        .network-topology h2 {
+            color: var(--primary-color);
+            border-bottom: 2px solid var(--primary-color);
+            padding-bottom: 10px;
+            margin-top: 0;
+        }
+       
+        .topology-info {
+            font-family: monospace;
+            white-space: pre;
+            background-color: #f0f0f0;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+            min-height: 100px;
+        }
+       
+        .flow-manager {
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+       
+        .flow-manager h2 {
+            color: var(--primary-color);
+            border-bottom: 2px solid var(--primary-color);
+            padding-bottom: 10px;
+            margin-top: 0;
+        }
+       
+        .routing-manager {
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+       
+        .routing-manager h2 {
+            color: var(--primary-color);
+            border-bottom: 2px solid var(--primary-color);
+            padding-bottom: 10px;
+            margin-top: 0;
+        }
+
+        .vlc-configuration {
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+
+        .vlc-configuration h2 {
+            color: var(--primary-color);
+            border-bottom: 2px solid var(--primary-color);
+            padding-bottom: 10px;
+            margin-top: 0;
+        }
+       
+        .form-section {
+            margin-bottom: 20px;
+        }
+       
+        .form-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            margin-bottom: 15px;
+        }
+       
+        .form-group {
+            flex: 1;
+            min-width: 200px;
+        }
+       
+        label {
+            display: block;
+            font-weight: bold;
+            margin-bottom: 5px;
+            color: var(--secondary-color);
+        }
+       
+        input, select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+       
+        button {
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: background-color 0.2s;
+        }
+       
+        button:hover {
+            background-color: var(--secondary-color);
+        }
+       
+        .btn-success {
+            background-color: var(--success-color);
+        }
+       
+        .btn-success:hover {
+            background-color: #27ae60;
+        }
+       
+        .btn-danger {
+            background-color: var(--error-color);
+        }
+       
+        .btn-danger:hover {
+            background-color: #c0392b;
+        }
+       
+        .btn-warning {
+            background-color: var(--accent-color);
+        }
+       
+        .btn-warning:hover {
+            background-color: #e67e22;
+        }
+
+        .btn-info {
+            background-color: #17a2b8;
+        }
+
+        .btn-info:hover {
+            background-color: #138496;
+        }
+       
+        .action-buttons {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+        }
+       
+        .match-section, .action-section {
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+       
+        .section-title {
+            font-weight: bold;
+            color: var(--secondary-color);
+            margin-bottom: 15px;
+        }
+       
+        .alert {
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 4px;
+            display: none;
+        }
+       
+        .alert-success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+       
+        .alert-danger {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+       
+        .alert-info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+       
+        .flows-list {
+            margin-top: 20px;
+        }
+       
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+       
+        th, td {
+            border: 1px solid #ddd;
+            padding: 10px;
+            text-align: left;
+        }
+       
+        th {
+            background-color: var(--primary-color);
+            color: white;
+        }
+       
+        tr:nth-child(even) {
+            background-color: #f9f9f9;
+        }
+       
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid var(--primary-color);
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+            display: none;
+        }
+       
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+       
+        .hidden {
+            display: none;
+        }
+       
+        #flowsTable {
+            overflow-x: auto;
+        }
+       
+        .algorithm-info {
+            margin-top: 15px;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+            border-left: 4px solid var(--primary-color);
+        }
+       
+        @media (max-width: 768px) {
+            .form-group {
+                min-width: 100%;
+            }
+           
+            .action-buttons {
+                flex-direction: column;
+            }
+           
+            button {
+                width: 100%;
+                margin-bottom: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>SDN Controller Interface</h1>
+    </header>
+   
+    <div class="container">
+        <div class="network-topology">
+            <h2>Network Topology</h2>
+            <div class="topology-info">
+                <pre id="topologyInfo">Loading network topology...</pre>
+            </div>
+        </div>
+       
+        <div class="routing-manager">
+            <h2>Shortest Path Algorithms</h2>
+           
+            <div id="routingAlert" class="alert"></div>
+           
+            <div class="form-section">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="routingAlgorithm">Select Routing Algorithm:</label>
+                        <select id="routingAlgorithm">
+                            <option value="dijkstra">Dijkstra (On-demand calculation)</option>
+                            <option value="floyd_warshall">Floyd-Warshall (Pre-calculated)</option>
+                        </select>
+                    </div>
+                </div>
+               
+                <div class="algorithm-info">
+                    <p><strong>Dijkstra:</strong> Calculates shortest paths on demand when needed. Lower memory usage but higher CPU usage per request.</p>
+                    <p><strong>Floyd-Warshall:</strong> Pre-calculates all shortest paths at startup. Higher memory usage but faster response time.</p>
+                </div>
+               
+                <div class="action-buttons">
+                    <button id="btnGetAlgorithm" class="btn-info">Get Current Algorithm</button>
+                    <button id="btnSetAlgorithm" class="btn-success">Set Algorithm</button>
+                    <button id="btnCompareAlgorithms" class="btn-warning">Compare Algorithms</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="routing-manager">
+            <h2>Load Balancing Algorithms</h2>
+           
+            <div id="loadBalancingAlert" class="alert"></div>
+           
+            <div class="form-section">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="loadBalancingAlgorithm">Select Load Balancing Algorithm:</label>
+                        <select id="loadBalancingAlgorithm">
+                            <option value="round_robin">Round Robin (Equal distribution)</option>
+                            <option value="weighted_round_robin">Weighted Round Robin (Capacity-aware)</option>
+                        </select>
+                    </div>
+                </div>
+               
+                <div class="algorithm-info">
+                    <p><strong>Round Robin:</strong> Distributes traffic evenly across all available paths in circular order.</p>
+                    <p><strong>Weighted Round Robin:</strong> Distributes traffic proportionally based on link capacity (100Gbps > 10Gbps > 1-9Gbps).</p>
+                </div>
+               
+                <div class="action-buttons">
+                    <button id="btnGetLoadBalancingAlgorithm" class="btn-info">Get Current Algorithm</button>
+                    <button id="btnSetLoadBalancingAlgorithm" class="btn-success">Set Algorithm</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="vlc-configuration">
+            <h2>VLC Server Configuration</h2>
+           
+            <div id="vlcAlert" class="alert"></div>
+           
+            <div class="form-section">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="vlcHost1">VLC Host 1 (requerido):</label>
+                        <select id="vlcHost1" required>
+                            <option value="">Select Host...</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="vlcHost2">VLC Host 2 (opcional):</label>
+                        <select id="vlcHost2">
+                            <option value="">Select Host...</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="vlcHost3">VLC Host 3 (opcional):</label>
+                        <select id="vlcHost3">
+                            <option value="">Select Host...</option>
+                        </select>
+                    </div>
+                </div>
+               
+                <div class="action-buttons">
+                    <button id="btnSetVlcHosts" class="btn-success">Set VLC Servers</button>
+                    <button id="btnGetVlcHosts" class="btn-info">Get Current VLC Servers</button>
+                </div>
+            </div>
+        </div>
+       
+        <div class="flow-manager">
+            <h2>Flow Rules Manager</h2>
+           
+            <div id="alertBox" class="alert"></div>
+            <div id="loader" class="loader"></div>
+           
+            <div class="form-section">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="switchSelect">Select Switch:</label>
+                        <select id="switchSelect">
+                            <option value="">Loading switches...</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="priority">Priority:</label>
+                        <input type="number" id="priority" value="1" min="0" max="65535">
+                    </div>
+                </div>
+               
+                <div class="match-section">
+                    <div class="section-title">Match Conditions</div>
+                   
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="inPort">In Port:</label>
+                            <input type="number" id="inPort" placeholder="e.g., 1">
+                        </div>
+                    </div>
+                   
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="ethSrc">Source MAC:</label>
+                            <input type="text" id="ethSrc" placeholder="e.g., 00:00:00:00:00:01">
+                        </div>
+                        <div class="form-group">
+                            <label for="ethDst">Destination MAC:</label>
+                            <input type="text" id="ethDst" placeholder="e.g., 00:00:00:00:00:08">
+                        </div>
+                    </div>
+                   
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="ipv4Src">Source IP:</label>
+                            <input type="text" id="ipv4Src" placeholder="e.g., 10.0.0.1">
+                        </div>
+                        <div class="form-group">
+                            <label for="ipv4Dst">Destination IP:</label>
+                            <input type="text" id="ipv4Dst" placeholder="e.g., 10.0.0.8">
+                        </div>
+                    </div>
+                   
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="tcpSrc">TCP Source Port:</label>
+                            <input type="number" id="tcpSrc" placeholder="e.g., 80 for HTTP">
+                        </div>
+                        <div class="form-group">
+                            <label for="tcpDst">TCP Destination Port:</label>
+                            <input type="number" id="tcpDst" placeholder="e.g., 80 for HTTP">
+                        </div>
+                    </div>
+                   
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="ipProto">IP Protocol:</label>
+                            <select id="ipProto">
+                                <option value="">Any</option>
+                                <option value="1">ICMP (1)</option>
+                                <option value="6">TCP (6)</option>
+                                <option value="17">UDP (17)</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+               
+                <div class="action-section">
+                    <div class="section-title">Action</div>
+                   
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="actionType">Action Type:</label>
+                            <select id="actionType">
+                                <option value="OUTPUT">OUTPUT (Forward to Port)</option>
+                                <option value="DROP">DROP (Block)</option>
+                            </select>
+                        </div>
+                        <div class="form-group" id="outputPortGroup">
+                            <label for="outputPort">Output Port:</label>
+                            <input type="number" id="outputPort" placeholder="Output port number">
+                        </div>
+                    </div>
+                </div>
+               
+                <div class="action-buttons">
+                    <button id="btnGetFlows" class="btn-info">GET Flows</button>
+                    <button id="btnAddFlow" class="btn-success">POST (Add Flow)</button>
+                    <button id="btnModifyFlow" class="btn-warning">PUT (Modify Flow)</button>
+                    <button id="btnDeleteFlow" class="btn-danger">DELETE Flow</button>
+                </div>
+            </div>
+           
+            <div class="flows-list">
+                <h3>Current Flows</h3>
+                <div id="flowsTable"></div>
+            </div>
+        </div>
+    </div>
+   
+    <script src="script.js"></script>
+    <script>
+    document.addEventListener("DOMContentLoaded", function () {
+    // Inicialización
+    async function init() {
+        await loadSwitches();
+        await loadTopology();
+        await getCurrentAlgorithm();
+        await getCurrentLoadBalancingAlgorithm();
+        loadVlcHostOptions();
+    }
+
+    // Función para mostrar alertas
+    function showAlert(message, type) {
+        const alertBox = document.getElementById("alertBox");
+        alertBox.textContent = message;
+        alertBox.className = `alert alert-${type}`;
+        alertBox.style.display = "block";
+        setTimeout(() => alertBox.style.display = "none", 5000);
+    }
+
+    // Función para mostrar alertas de enrutamiento
+    function showRoutingAlert(message, type) {
+        const alertBox = document.getElementById("routingAlert");
+        alertBox.textContent = message;
+        alertBox.className = `alert alert-${type}`;
+        alertBox.style.display = "block";
+        setTimeout(() => alertBox.style.display = "none", 5000);
+    }
+
+    // Función para mostrar alertas de balanceo de carga
+    function showLoadBalancingAlert(message, type) {
+        const alertBox = document.getElementById("loadBalancingAlert");
+        alertBox.textContent = message;
+        alertBox.className = `alert alert-${type}`;
+        alertBox.style.display = "block";
+        setTimeout(() => alertBox.style.display = "none", 5000);
+    }
+
+    // Función para mostrar alertas de VLC
+    function showVlcAlert(message, type) {
+        const alertBox = document.getElementById("vlcAlert");
+        alertBox.textContent = message;
+        alertBox.className = `alert alert-${type}`;
+        alertBox.style.display = "block";
+        setTimeout(() => alertBox.style.display = "none", 5000);
+    }
+
+    // Función para mostrar/ocultar loader
+    function toggleLoader(show) {
+        document.getElementById("loader").style.display = show ? "block" : "none";
+    }
+
+    // Cargar switches disponibles
+    async function loadSwitches() {
+        console.log("🌐 Loading switches...");
+        toggleLoader(true);
+       
+        try {
+            const switches = await RyuController.getSwitches();
+            console.log("✅ Switches received:", switches);
+            const switchSelect = document.getElementById("switchSelect");
+            switchSelect.innerHTML = "";
+
+            if (switches && switches.length > 0) {
+                switches.forEach(dpid => {
+                    const option = document.createElement("option");
+                    option.value = dpid;
+                    option.textContent = `Switch ${dpid}`;
+                    switchSelect.appendChild(option);
+                });
+            } else {
+                // Cargar switches de ejemplo si no hay datos
+                for (let i = 1; i <= 43; i++) {
+                    const option = document.createElement("option");
+                    option.value = i;
+                    option.textContent = `Switch ${i}`;
+                    switchSelect.appendChild(option);
+                }
+            }
+        } catch (error) {
+            console.error("❌ Error getting switches:", error);
+            showAlert("Error loading switches. Using sample data.", "danger");
+            // Cargar switches de ejemplo
+            const switchSelect = document.getElementById("switchSelect");
+            switchSelect.innerHTML = "";
+            for (let i = 1; i <= 43; i++) {
+                const option = document.createElement("option");
+                option.value = i;
+                option.textContent = `Switch ${i}`;
+                switchSelect.appendChild(option);
+            }
+        } finally {
+            toggleLoader(false);
+        }
+    }
+
+    // Cargar opciones de hosts para VLC
+    function loadVlcHostOptions() {
+        const hostSelects = [
+            document.getElementById("vlcHost1"),
+            document.getElementById("vlcHost2"),
+            document.getElementById("vlcHost3")
+        ];
+
+        // Limpiar opciones existentes
+        hostSelects.forEach(select => {
+            select.innerHTML = '<option value="">Select Host...</option>';
+        });
+
+        // Generar todas las opciones posibles (h1_1 a h43_2)
+        for (let i = 1; i <= 43; i++) {
+            for (let j = 1; j <= 2; j++) {
+                const hostName = `h${i}_${j}`;
+                hostSelects.forEach(select => {
+                    const option = document.createElement("option");
+                    option.value = hostName;
+                    option.textContent = hostName;
+                    select.appendChild(option);
+                });
+            }
+        }
+    }
+
+    // Cargar la topología de red
+    async function loadTopology() {
+        console.log("🌐 Loading network topology...");
+        toggleLoader(true);
+       
+        try {
+            const topology = await RyuController.getTopology();
+            console.log("✅ Topology received:", topology);
+            document.getElementById("topologyInfo").textContent = JSON.stringify(topology, null, 2);
+        } catch (error) {
+            console.error("❌ Error getting topology:", error);
+            document.getElementById("topologyInfo").textContent = "Network topology information not available";
+            showAlert("Error loading topology data", "danger");
+        } finally {
+            toggleLoader(false);
+        }
+    }
+
+    // Obtener el algoritmo de enrutamiento actual
+    async function getCurrentAlgorithm() {
+        console.log("🌐 Getting current routing algorithm...");
+        toggleLoader(true);
+       
+        try {
+            const algorithmInfo = await RyuController.getRoutingAlgorithm();
+            console.log("✅ Current algorithm:", algorithmInfo);
+            document.getElementById("routingAlgorithm").value = algorithmInfo.current_algorithm;
+            showRoutingAlert(`Current routing algorithm: ${algorithmInfo.current_algorithm}`, "success");
+        } catch (error) {
+            console.error("❌ Error getting algorithm:", error);
+            document.getElementById("routingAlgorithm").value = "dijkstra";
+            showRoutingAlert("Using default Dijkstra algorithm", "info");
+        } finally {
+            toggleLoader(false);
+        }
+    }
+
+    // Obtener el algoritmo de balanceo de carga actual
+    async function getCurrentLoadBalancingAlgorithm() {
+        console.log("🌐 Getting current load balancing algorithm...");
+        toggleLoader(true);
+       
+        try {
+            const algorithmInfo = await RyuController.getLoadBalancingAlgorithm();
+            console.log("✅ Current load balancing algorithm:", algorithmInfo);
+            document.getElementById("loadBalancingAlgorithm").value = algorithmInfo.current_algorithm;
+            showLoadBalancingAlert(`Current load balancing algorithm: ${algorithmInfo.current_algorithm}`, "success");
+        } catch (error) {
+            console.error("❌ Error getting load balancing algorithm:", error);
+            document.getElementById("loadBalancingAlgorithm").value = "round_robin";
+            showLoadBalancingAlert("Using default Round Robin algorithm", "info");
+        } finally {
+            toggleLoader(false);
+        }
+    }
+
+    // Obtener hosts VLC actuales
+    async function getCurrentVlcHosts() {
+        console.log("🌐 Getting current VLC hosts...");
+        toggleLoader(true);
+       
+        try {
+            const vlcHosts = await RyuController.getVlcHosts();
+            console.log("✅ Current VLC hosts:", vlcHosts);
+            if (vlcHosts.vlc_hosts && vlcHosts.vlc_hosts.length > 0) {
+                document.getElementById("vlcHost1").value = vlcHosts.vlc_hosts[0] || "";
+                document.getElementById("vlcHost2").value = vlcHosts.vlc_hosts[1] || "";
+                document.getElementById("vlcHost3").value = vlcHosts.vlc_hosts[2] || "";
+                showVlcAlert("VLC hosts loaded successfully", "success");
+            }
+        } catch (error) {
+            console.error("❌ Error getting VLC hosts:", error);
+            showVlcAlert("Error loading VLC hosts", "danger");
+        } finally {
+            toggleLoader(false);
+        }
+    }
+
+    // Establecer el algoritmo de enrutamiento
+    document.getElementById("btnSetAlgorithm").addEventListener("click", async function() {
+        const algorithm = document.getElementById("routingAlgorithm").value;
+        console.log(`🌐 Setting routing algorithm to: ${algorithm}`);
+        toggleLoader(true);
+       
+        try {
+            const result = await RyuController.setRoutingAlgorithm(algorithm);
+            console.log("✅ Algorithm set:", result);
+            showRoutingAlert(`Routing algorithm set to: ${algorithm}`, "success");
+        } catch (error) {
+            console.error("❌ Error setting algorithm:", error);
+            showRoutingAlert(error.message || "Failed to set routing algorithm", "danger");
+        } finally {
+            toggleLoader(false);
+        }
+    });
+
+    // Establecer el algoritmo de balanceo de carga
+    document.getElementById("btnSetLoadBalancingAlgorithm").addEventListener("click", async function() {
+        const algorithm = document.getElementById("loadBalancingAlgorithm").value;
+        console.log(`🌐 Setting load balancing algorithm to: ${algorithm}`);
+        toggleLoader(true);
+       
+        try {
+            const result = await RyuController.setLoadBalancingAlgorithm(algorithm);
+            console.log("✅ Load balancing algorithm set:", result);
+            showLoadBalancingAlert(`Load balancing algorithm set to: ${algorithm}`, "success");
+        } catch (error) {
+            console.error("❌ Error setting load balancing algorithm:", error);
+            showLoadBalancingAlert(error.message || "Failed to set load balancing algorithm", "danger");
+        } finally {
+            toggleLoader(false);
+        }
+    });
+
+    // Comparar algoritmos de enrutamiento
+    document.getElementById("btnCompareAlgorithms").addEventListener("click", async function() {
+        const srcDpid = prompt("Enter source switch ID (1-43):");
+        const dstDpid = prompt("Enter destination switch ID (1-43):");
+       
+        if (!srcDpid || !dstDpid || isNaN(srcDpid) || isNaN(dstDpid)) {
+            showRoutingAlert("Please enter valid switch IDs (1-43)", "danger");
+            return;
+        }
+       
+        console.log(`🌐 Comparing routing algorithms for path ${srcDpid}->${dstDpid}`);
+        toggleLoader(true);
+       
+        try {
+            const comparison = await RyuController.compareRoutingAlgorithms(srcDpid, dstDpid);
+            console.log("✅ Comparison results:", comparison);
+           
+            let comparisonMessage = `Comparison for path s${srcDpid} -> s${dstDpid}:\n\n`;
+           
+            if (comparison.dijkstra && comparison.dijkstra.path) {
+                comparisonMessage += `Dijkstra:\n`;
+                comparisonMessage += `  Path: ${comparison.dijkstra.path.join(' -> ')}\n`;
+                comparisonMessage += `  Distance: ${comparison.dijkstra.distance}\n`;
+                comparisonMessage += `  Hops: ${comparison.dijkstra.hops}\n\n`;
+            }
+           
+            if (comparison.floyd_warshall && comparison.floyd_warshall.path) {
+                comparisonMessage += `Floyd-Warshall:\n`;
+                comparisonMessage += `  Path: ${comparison.floyd_warshall.path.join(' -> ')}\n`;
+                comparisonMessage += `  Distance: ${comparison.floyd_warshall.distance}\n`;
+                comparisonMessage += `  Hops: ${comparison.floyd_warshall.hops}\n\n`;
+            }
+           
+            if (comparison.same_path !== undefined) {
+                comparisonMessage += `Same path: ${comparison.same_path ? 'Yes' : 'No'}\n`;
+            }
+           
+            showRoutingAlert(comparisonMessage, "info");
+        } catch (error) {
+            console.error("❌ Error comparing algorithms:", error);
+            showRoutingAlert(error.message || "Failed to compare routing algorithms", "danger");
+        } finally {
+            toggleLoader(false);
+        }
+    });
+
+    // Obtener flujos de un switch
+    document.getElementById("btnGetFlows").addEventListener("click", async function () {
+        const dpid = document.getElementById("switchSelect").value;
+        if (!dpid) {
+            showAlert("Please select a switch first.", "danger");
+            return;
+        }
+
+        console.log(`🌐 Getting flows for switch ${dpid}`);
+        toggleLoader(true);
+       
+        try {
+            const flows = await RyuController.getFlows(dpid);
+            console.log(`✅ Flows for switch ${dpid}:`, flows);
+           
+            // Crear tabla para mostrar los flujos
+            if (flows.length === 0) {
+                document.getElementById("flowsTable").innerHTML = "<p>No flow rules found</p>";
+                return;
+            }
+           
+            const table = document.createElement("table");
+            const thead = document.createElement("thead");
+            const tbody = document.createElement("tbody");
+           
+            // Crear encabezado de tabla
+            const headerRow = document.createElement("tr");
+            ["Priority", "Match", "Actions"].forEach(text => {
+                const th = document.createElement("th");
+                th.textContent = text;
+                headerRow.appendChild(th);
+            });
+            thead.appendChild(headerRow);
+            table.appendChild(thead);
+           
+            // Crear filas de tabla
+            flows.forEach(flow => {
+                const row = document.createElement("tr");
+               
+                const priorityCell = document.createElement("td");
+                priorityCell.textContent = flow.priority || "N/A";
+                row.appendChild(priorityCell);
+               
+                const matchCell = document.createElement("td");
+                matchCell.textContent = JSON.stringify(flow.match || {});
+                row.appendChild(matchCell);
+               
+                const actionsCell = document.createElement("td");
+                // Mostrar "DROP" si no hay acciones definidas
+                actionsCell.textContent = (flow.actions && flow.actions.length > 0) ?
+                    JSON.stringify(flow.actions) : "DROP";
+                row.appendChild(actionsCell);
+               
+                tbody.appendChild(row);
+            });
+           
+            table.appendChild(tbody);
+            document.getElementById("flowsTable").innerHTML = "";
+            document.getElementById("flowsTable").appendChild(table);
+        } catch (error) {
+            console.error(`❌ Error getting flows for switch ${dpid}:`, error);
+            showAlert(`Error getting flows for switch ${dpid}: ${error.message}`, "danger");
+            document.getElementById("flowsTable").innerHTML = "<p>Error loading flow rules</p>";
+        } finally {
+            toggleLoader(false);
+        }
+    });
+
+    // Agregar regla de flujo
+    document.getElementById("btnAddFlow").addEventListener("click", async function () {
+        const dpid = document.getElementById("switchSelect").value;
+        if (!dpid) {
+            showAlert("Please select a switch first.", "danger");
+            return;
+        }
+
+        const priority = parseInt(document.getElementById("priority").value);
+        if (isNaN(priority)) {
+            showAlert("Priority must be a number.", "danger");
+            return;
+        }
+
+        const matchFields = {
+            in_port: parseInt(document.getElementById("inPort").value) || undefined,
+            eth_src: document.getElementById("ethSrc").value || undefined,
+            eth_dst: document.getElementById("ethDst").value || undefined,
+            ipv4_src: document.getElementById("ipv4Src").value || undefined,
+            ipv4_dst: document.getElementById("ipv4Dst").value || undefined,
+            tcp_src: parseInt(document.getElementById("tcpSrc").value) || undefined,
+            tcp_dst: parseInt(document.getElementById("tcpDst").value) || undefined,
+            ip_proto: parseInt(document.getElementById("ipProto").value) || undefined
+        };
+
+        // Eliminar campos undefined
+        Object.keys(matchFields).forEach(key => {
+            if (matchFields[key] === undefined) {
+                delete matchFields[key];
+            }
+        });
+
+        const hasMatchFields = Object.keys(matchFields).length > 0;
+        if (!hasMatchFields) {
+            showAlert("You must specify at least one match field.", "danger");
+            return;
+        }
+
+        const actionType = document.getElementById("actionType").value;
+        let actions = [];
+       
+        if (actionType === "OUTPUT") {
+            const outputPort = document.getElementById("outputPort").value;
+            // El puerto de salida ya no es obligatorio
+            if (outputPort) {
+                actions.push({
+                    type: "OUTPUT",
+                    port: parseInt(outputPort)
+                });
+            }
+        }
+
+        // Crear el objeto flowRule
+        const flowRule = {
+            dpid: parseInt(dpid),
+            priority: priority,
+            match: matchFields
+        };
+
+        // Agregar acciones solo si hay alguna definida
+        if (actions.length > 0) {
+            flowRule.actions = actions;
+        }
+
+        console.log("🌐 Adding flow rule:", flowRule);
+        toggleLoader(true);
+       
+        try {
+            const result = await RyuController.addFlow(dpid, flowRule);
+            console.log("✅ Flow rule added:", result);
+            showAlert("Flow rule added successfully", "success");
+            document.getElementById("btnGetFlows").click(); // Actualizar lista de flujos
+        } catch (error) {
+            console.error("❌ Error adding flow rule:", error);
+            showAlert(error.message || "Error adding flow rule", "danger");
+        } finally {
+            toggleLoader(false);
+        }
+    });
+
+    // Establecer hosts VLC
+    async function setVlcHosts() {
+        const selectedHosts = [];
+        const hostSelects = [
+            document.getElementById("vlcHost1"),
+            document.getElementById("vlcHost2"),
+            document.getElementById("vlcHost3")
+        ];
+       
+        hostSelects.forEach(select => {
+            if (select.value) selectedHosts.push(select.value);
+        });
+       
+        if (selectedHosts.length < 1) {
+            showVlcAlert("Debe seleccionar al menos 1 host VLC", "danger");
+            return;
+        }
+       
+        console.log(`🌐 Setting VLC hosts to: ${selectedHosts.join(', ')}`);
+        toggleLoader(true);
+       
+        try {
+            const result = await RyuController.setVlcHosts(selectedHosts);
+            console.log("✅ VLC hosts set:", result);
+            showVlcAlert("VLC hosts configurados correctamente", "success");
+        } catch (error) {
+            console.error("❌ Error setting VLC hosts:", error);
+            showVlcAlert(error.message || "Error configurando hosts VLC", "danger");
+        } finally {
+            toggleLoader(false);
+        }
+    }
+
+    // Mostrar/ocultar el campo de puerto de salida según el tipo de acción
+    document.getElementById("actionType").addEventListener("change", function() {
+        const outputPortGroup = document.getElementById("outputPortGroup");
+        outputPortGroup.style.display = this.value === "OUTPUT" ? "block" : "none";
+    });
+
+    // Button to get current algorithm
+    document.getElementById("btnGetAlgorithm").addEventListener("click", getCurrentAlgorithm);
+
+    // Button to get current load balancing algorithm
+    document.getElementById("btnGetLoadBalancingAlgorithm").addEventListener("click", getCurrentLoadBalancingAlgorithm);
+
+    // Button to get current VLC hosts
+    document.getElementById("btnGetVlcHosts").addEventListener("click", getCurrentVlcHosts);
+
+    // Button to set VLC hosts
+    document.getElementById("btnSetVlcHosts").addEventListener("click", setVlcHosts);
+
+    // Inicializar la aplicación
+    init();
+});
+    </script>
+</body>
+</html>
