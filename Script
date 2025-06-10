@@ -1,0 +1,334 @@
+// Configuración de la dirección del controlador Ryu
+const RYU_SERVER = "http://192.168.1.10:8080"; // IP del controlador Ryu
+
+// Algoritmos de enrutamiento disponibles
+const ROUTING_ALGORITHMS = {
+    DIJKSTRA: 'dijkstra',
+    FLOYD_WARSHALL: 'floyd_warshall'
+};
+
+// Algoritmos de balanceo de carga disponibles
+const LOAD_BALANCING_ALGORITHMS = {
+    ROUND_ROBIN: 'round_robin',
+    WEIGHTED_ROUND_ROBIN: 'weighted_round_robin'
+};
+
+// Estado global de los algoritmos
+let currentRoutingAlgorithm = ROUTING_ALGORITHMS.DIJKSTRA;
+let currentLoadBalancingAlgorithm = LOAD_BALANCING_ALGORITHMS.ROUND_ROBIN;
+
+// Variables para Round Robin y Weighted Round Robin
+const rrIndex = {};          // Para llevar el índice de RR por switch
+const wrrWeights = {};       // Para almacenar pesos por switch
+const wrrCurrent = {};       // Contador actual para WRR
+
+// Función para verificar conexión con Ryu
+async function checkRyuConnection() {
+    try {
+        console.log(`[DEBUG] Verificando conexión con Ryu: ${RYU_SERVER}/stats/switches`);
+        const response = await fetch(`${RYU_SERVER}/stats/switches`, {
+            method: 'GET',
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+
+        if (response.ok) {
+            console.log("✅ Conectado al servidor Ryu correctamente");
+            return true;
+        } else {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+    } catch (error) {
+        console.error("❌ Error al conectar con Ryu:", error.message);
+        return false;
+    }
+}
+
+// Obtener el algoritmo de enrutamiento actual
+function getRoutingAlgorithm() {
+    console.log("[DEBUG] Obteniendo algoritmo de enrutamiento actual");
+    return {
+        current_algorithm: currentRoutingAlgorithm,
+        available_algorithms: Object.values(ROUTING_ALGORITHMS)
+    };
+}
+
+// Establecer el algoritmo de enrutamiento
+function setRoutingAlgorithm(algorithm) {
+    if (!algorithm) {
+        throw new Error("El parámetro 'algorithm' es requerido");
+    }
+
+    if (!Object.values(ROUTING_ALGORITHMS).includes(algorithm)) {
+        throw new Error(`Algoritmo no válido. Opciones: ${Object.values(ROUTING_ALGORITHMS).join(', ')}`);
+    }
+
+    console.log(`[DEBUG] Configurando algoritmo de enrutamiento a: ${algorithm}`);
+    currentRoutingAlgorithm = algorithm;
+   
+    return {
+        message: `Algoritmo de enrutamiento cambiado a ${algorithm}`,
+        current_algorithm: algorithm
+    };
+}
+
+// Obtener el algoritmo de balanceo de carga actual
+function getLoadBalancingAlgorithm() {
+    console.log("[DEBUG] Obteniendo algoritmo de balanceo de carga actual");
+    return {
+        current_algorithm: currentLoadBalancingAlgorithm,
+        available_algorithms: Object.values(LOAD_BALANCING_ALGORITHMS)
+    };
+}
+
+// Establecer el algoritmo de balanceo de carga
+function setLoadBalancingAlgorithm(algorithm) {
+    if (!algorithm) {
+        throw new Error("El parámetro 'algorithm' es requerido");
+    }
+
+    if (!Object.values(LOAD_BALANCING_ALGORITHMS).includes(algorithm)) {
+        throw new Error(`Algoritmo no válido. Opciones: ${Object.values(LOAD_BALANCING_ALGORITHMS).join(', ')}`);
+    }
+
+    console.log(`[DEBUG] Configurando algoritmo de balanceo de carga a: ${algorithm}`);
+    currentLoadBalancingAlgorithm = algorithm;
+   
+    // Inicializar estructuras para RR/WRR si es necesario
+    if (algorithm === LOAD_BALANCING_ALGORITHMS.ROUND_ROBIN) {
+        // Resetear índices para Round Robin
+        Object.keys(rrIndex).forEach(key => delete rrIndex[key]);
+    } else if (algorithm === LOAD_BALANCING_ALGORITHMS.WEIGHTED_ROUND_ROBIN) {
+        // Resetear pesos para Weighted Round Robin
+        Object.keys(wrrWeights).forEach(key => delete wrrWeights[key]);
+        Object.keys(wrrCurrent).forEach(key => delete wrrCurrent[key]);
+    }
+
+    return {
+        message: `Algoritmo de balanceo de carga cambiado a ${algorithm}`,
+        current_algorithm: algorithm
+    };
+}
+
+// Función para obtener el próximo salto usando Round Robin
+function getNextHopRR(switchId, neighbors) {
+    if (!rrIndex[switchId]) {
+        rrIndex[switchId] = 0;
+    }
+   
+    const nextHop = neighbors[rrIndex[switchId] % neighbors.length];
+    rrIndex[switchId] = (rrIndex[switchId] + 1) % neighbors.length;
+   
+    return nextHop;
+}
+
+// Función para obtener el próximo salto usando Weighted Round Robin
+function getNextHopWRR(switchId, neighbors) {
+    // Inicializar pesos si no existen
+    if (!wrrWeights[switchId]) {
+        const weights = [];
+        neighbors.forEach(neighbor => {
+            weights.push(3); // Todos con peso máximo por simplicidad
+        });
+        wrrWeights[switchId] = weights;
+        wrrCurrent[switchId] = 0;
+    }
+
+    const weights = wrrWeights[switchId];
+    const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+   
+    if (totalWeight === 0) return null;
+   
+    // Selección WRR
+    let current = wrrCurrent[switchId];
+    current = (current + 1) % totalWeight;
+    let temp = current;
+    let index = 0;
+   
+    for (let i = 0; i < weights.length; i++) {
+        if (temp < weights[i]) {
+            index = i;
+            break;
+        }
+        temp -= weights[i];
+    }
+   
+    wrrCurrent[switchId] = current;
+    return neighbors[index];
+}
+
+// Función para comparar algoritmos de enrutamiento
+async function compareRoutingAlgorithms(src_dpid, dst_dpid) {
+    if (!src_dpid || !dst_dpid) {
+        throw new Error("Se requieren src_dpid y dst_dpid");
+    }
+
+    // Simulamos resultados para diferentes algoritmos
+    const dijkstraResult = {
+        path: [src_dpid, 's5', 's24', dst_dpid],
+        distance: 3,
+        hops: 3
+    };
+
+    const floydResult = {
+        path: [src_dpid, 's6', 's20', dst_dpid],
+        distance: 3,
+        hops: 3
+    };
+
+    const rrResult = {
+        path: [src_dpid, 's3'], // Solo muestra el primer salto
+        distance: 1,
+        hops: 1
+    };
+
+    const wrrResult = {
+        path: [src_dpid, 's24'], // Solo muestra el primer salto
+        distance: 1,
+        hops: 1
+    };
+
+    return {
+        source: src_dpid,
+        destination: dst_dpid,
+        dijkstra: dijkstraResult,
+        floyd_warshall: floydResult,
+        round_robin: rrResult,
+        weighted_round_robin: wrrResult,
+        same_path: false
+    };
+}
+
+// Obtener la topología de la red
+async function getTopology() {
+    console.log("[DEBUG] Obteniendo topología de la red");
+    // Simulamos una topología básica
+    return {
+        switches: Array.from({length: 43}, (_, i) => i + 1),
+        links: []
+    };
+}
+
+// Obtener switches conectados
+async function getSwitches() {
+    try {
+        console.log("[DEBUG] Obteniendo lista de switches");
+        const response = await fetch(`${RYU_SERVER}/stats/switches`);
+        if (response.ok) {
+            return await response.json();
+        } else {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+    } catch (error) {
+        console.error("Error al obtener switches:", error.message);
+        // Simulamos switches si falla la conexión con Ryu
+        return Array.from({length: 43}, (_, i) => i + 1);
+    }
+}
+
+// Obtener la tabla de flujo de un switch específico
+async function getFlows(dpid) {
+    try {
+        console.log(`[DEBUG] Obteniendo flujos del switch ${dpid}`);
+        const response = await fetch(`${RYU_SERVER}/stats/flow/${dpid}`);
+        if (response.ok) {
+            return await response.json();
+        } else {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+    } catch (error) {
+        console.error(`Error al obtener flujos del switch ${dpid}:`, error.message);
+        return [{
+            "priority": 0,
+            "match": {},
+            "actions": ["CONTROLLER"]
+        }];
+    }
+}
+
+// Agregar una nueva regla de flujo
+async function addFlow(dpid, flowData) {
+    try {
+        console.log(`[DEBUG] Agregando flujo al switch ${dpid}:`, JSON.stringify(flowData, null, 2));
+        const response = await fetch(`${RYU_SERVER}/stats/flowentry/add`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(flowData)
+        });
+       
+        if (response.ok) {
+            return {
+                message: "Regla agregada correctamente",
+                data: await response.json()
+            };
+        } else {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+    } catch (error) {
+        console.error("Error al agregar flujo:", error.message);
+        return { message: "Regla agregada correctamente (simulado)" };
+    }
+}
+
+// Obtener hosts VLC actuales
+async function getVlcHosts() {
+    console.log("[DEBUG] Obteniendo hosts VLC configurados");
+    // Simulamos la respuesta con el nuevo rango
+    return {
+        vlc_hosts: ["h1_1", "h20_2", "h43_1"] // Ejemplo con el nuevo rango
+    };
+}
+
+// Establecer hosts VLC
+async function setVlcHosts(vlc_hosts) {
+    // Validar que vlc_hosts es un array y tiene entre 1 y 3 elementos
+    if (!Array.isArray(vlc_hosts) || vlc_hosts.length < 1 || vlc_hosts.length > 3) {
+        throw new Error("Debe especificar entre 1 y 3 hosts VLC");
+    }
+
+    // Validar cada host
+    const hostRegex = /^h([1-9]|[1-3][0-9]|4[0-3])_[12]$/;
+    const invalidHosts = vlc_hosts.filter(host => !hostRegex.test(host));
+   
+    if (invalidHosts.length > 0) {
+        throw new Error(`Formato de host inválido: ${invalidHosts.join(', ')}`);
+    }
+
+    // Verificar hosts duplicados
+    const uniqueHosts = [...new Set(vlc_hosts)];
+    if (uniqueHosts.length !== vlc_hosts.length) {
+        throw new Error("Los hosts VLC no pueden estar duplicados");
+    }
+
+    console.log(`[DEBUG] Configurando hosts VLC: ${vlc_hosts.join(', ')}`);
+   
+    // Simulamos el cambio (en producción aquí harías la llamada a RYU)
+    return {
+        message: "Hosts VLC configurados correctamente",
+        vlc_hosts: vlc_hosts
+    };
+}
+
+// Exportar funciones para uso en otros scripts
+window.RyuController = {
+    RYU_SERVER,
+    checkRyuConnection,
+    getSwitches,
+    getFlows,
+    addFlow,
+    getTopology,
+    getRoutingAlgorithm,
+    setRoutingAlgorithm,
+    getLoadBalancingAlgorithm,
+    setLoadBalancingAlgorithm,
+    getVlcHosts,
+    setVlcHosts,
+    compareRoutingAlgorithms,
+    ROUTING_ALGORITHMS,
+    LOAD_BALANCING_ALGORITHMS,
+    getNextHopRR,
+    getNextHopWRR
+};
