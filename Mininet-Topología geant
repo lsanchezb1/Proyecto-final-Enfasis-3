@@ -1,0 +1,851 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from mininet.topo import Topo
+from mininet.net import Mininet
+from mininet.node import Controller, RemoteController, OVSKernelSwitch
+from mininet.cli import CLI
+from mininet.log import setLogLevel, info
+from mininet.link import TCLink
+import json
+import time
+import re
+from flask import Flask, request, jsonify
+from threading import Thread
+
+class FloydWarshallCalculator:
+    """Implementacion del algoritmo Floyd-Warshall para calcular rutas mas cortas"""
+   
+    def __init__(self):
+        self.graph = {}
+        self.distances = {}
+        self.next_hop = {}
+        self.nodes = set()
+        self.port_mappings = {}  # Mapeo de puertos entre switches
+        self.topology_info = {}
+        self.routing_algorithm = 'floyd_warshall'  # MODIFICADO: Anadir atributo para algoritmo de enrutamiento
+        self.rr_index = {}       # MODIFICADO: Para Round Robin
+        self.wrr_weights = {}    # MODIFICADO: Para Weighted Round Robin
+        self.wrr_current = {}    # MODIFICADO: Para Weighted Round Robin
+   
+    def set_routing_algorithm(self, algorithm):
+        """MODIFICADO: Establecer el algoritmo de enrutamiento a usar"""
+        valid_algorithms = ['floyd_warshall', 'round_robin', 'weighted_round_robin']
+        if algorithm in valid_algorithms:
+            self.routing_algorithm = algorithm
+            return True
+        return False
+   
+    def add_edge(self, src, dst, weight):
+        """Agregar arista al grafo"""
+        self.nodes.add(src)
+        self.nodes.add(dst)
+       
+        if src not in self.graph:
+            self.graph[src] = {}
+        if dst not in self.graph:
+            self.graph[dst] = {}
+           
+        # Grafo no dirigido - agregar en ambas direcciones
+        self.graph[src][dst] = weight
+        self.graph[dst][src] = weight
+   
+    def calculate_shortest_paths(self):
+        """Ejecutar algoritmo Floyd-Warshall"""
+        nodes = sorted(list(self.nodes))
+        n = len(nodes)
+       
+        # Inicializar matrices de distancia y proximo salto
+        INF = float('inf')
+       
+        # Inicializar distancias
+        for i in nodes:
+            self.distances[i] = {}
+            self.next_hop[i] = {}
+            for j in nodes:
+                if i == j:
+                    self.distances[i][j] = 0
+                    self.next_hop[i][j] = j
+                elif j in self.graph.get(i, {}):
+                    self.distances[i][j] = self.graph[i][j]
+                    self.next_hop[i][j] = j
+                else:
+                    self.distances[i][j] = INF
+                    self.next_hop[i][j] = None
+       
+        # Algoritmo Floyd-Warshall
+        for k in nodes:
+            for i in nodes:
+                for j in nodes:
+                    if (self.distances[i][k] != INF and
+                        self.distances[k][j] != INF and
+                        self.distances[i][k] + self.distances[k][j] < self.distances[i][j]):
+                       
+                        self.distances[i][j] = self.distances[i][k] + self.distances[k][j]
+                        self.next_hop[i][j] = self.next_hop[i][k]
+   
+    def get_shortest_path(self, src, dst):
+        """Obtener la ruta mas corta entre dos nodos"""
+        if self.routing_algorithm == 'floyd_warshall':
+            if src not in self.nodes or dst not in self.nodes:
+                return None, float('inf')
+           
+            if self.distances[src][dst] == float('inf'):
+                return None, float('inf')
+           
+            path = [src]
+            current = src
+           
+            while current != dst:
+                current = self.next_hop[current][dst]
+                if current is None:
+                    return None, float('inf')
+                path.append(current)
+           
+            return path, self.distances[src][dst]
+       
+        elif self.routing_algorithm == 'round_robin':
+            # MODIFICADO: Implementacion Round Robin
+            neighbors = sorted(list(self.graph.get(src, {}).keys()))
+            if not neighbors:
+                return None, float('inf')
+           
+            if src not in self.rr_index:
+                self.rr_index[src] = 0
+           
+            idx = self.rr_index[src] % len(neighbors)
+            next_hop = neighbors[idx]
+            self.rr_index[src] = (self.rr_index[src] + 1) % len(neighbors)
+           
+            return [src, next_hop], 1  # Distancia 1 para el primer salto
+           
+        elif self.routing_algorithm == 'weighted_round_robin':
+            # MODIFICADO: Implementacion Weighted Round Robin
+            neighbors = sorted(list(self.graph.get(src, {}).keys()))
+            if not neighbors:
+                return None, float('inf')
+           
+            # Inicializar pesos si no existen
+            if src not in self.wrr_weights:
+                weights = []
+                for neighbor in neighbors:
+                    # Asignar pesos basados en capacidad del enlace (inverso al peso)
+                    weight = 1 / self.graph[src][neighbor] if self.graph[src][neighbor] != 0 else 1
+                    weights.append(int(weight * 10))  # Escalar para tener pesos enteros
+                self.wrr_weights[src] = weights
+                self.wrr_current[src] = 0
+           
+            weights = self.wrr_weights[src]
+            total_weight = sum(weights)
+            if total_weight == 0:
+                return None, float('inf')
+           
+            # Seleccion WRR
+            current = self.wrr_current[src]
+            current = (current + 1) % total_weight
+            temp = current
+            index = 0
+            for i, w in enumerate(weights):
+                if temp < w:
+                    index = i
+                    break
+                temp -= w
+           
+            next_hop = neighbors[index]
+            self.wrr_current[src] = current
+           
+            return [src, next_hop], 1  # Distancia 1 para el primer salto
+       
+        else:
+            return None, float('inf')
+   
+    def get_all_shortest_paths(self):
+        """Obtener todas las rutas mas cortas"""
+        all_paths = {}
+        for src in self.nodes:
+            all_paths[src] = {}
+            for dst in self.nodes:
+                if src != dst:
+                    path, distance = self.get_shortest_path(src, dst)
+                    all_paths[src][dst] = {
+                        'path': path,
+                        'distance': distance,
+                        'hops': len(path) - 1 if path else float('inf')
+                    }
+        return all_paths
+   
+    def extract_port_mappings_from_net(self, net):
+        """Extraer mapeo de puertos automaticamente desde Mininet"""
+        self.port_mappings = {}
+        self.topology_info = {
+            'switches': {},
+            'links': [],
+            'hosts': {}
+        }
+       
+        # Informacion de switches
+        for switch in net.switches:
+            switch_id = int(switch.name[1:])
+            self.topology_info['switches'][switch_id] = {
+                'name': switch.name,
+                'dpid': switch.dpid,
+                'ports': {},
+                'connected_switches': []
+            }
+       
+        # Informacion de hosts
+        for host in net.hosts:
+            host_parts = host.name.split('_')
+            if len(host_parts) == 2:
+                switch_id = int(host_parts[0][1:])  # h1_1 -> 1
+                host_num = int(host_parts[1])       # h1_1 -> 1
+               
+                if switch_id not in self.topology_info['hosts']:
+                    self.topology_info['hosts'][switch_id] = []
+               
+                self.topology_info['hosts'][switch_id].append({
+                    'name': host.name,
+                    'ip': host.IP(),
+                    'mac': host.MAC(),
+                    'host_num': host_num
+                })
+       
+        # Extraer informacion de enlaces y puertos
+        switch_port_counter = {}  # Contador de puertos por switch
+       
+        for link in net.links:
+            node1, node2 = link.intf1.node, link.intf2.node
+           
+            # Solo procesar enlaces entre switches
+            if (hasattr(node1, 'dpid') and
+                hasattr(node2, 'dpid') and
+                node1.name.startswith('s') and
+                node2.name.startswith('s')):
+               
+                switch1_id = int(node1.name[1:])
+                switch2_id = int(node2.name[1:])
+               
+                # Obtener numeros de puerto
+                try:
+                    port1 = int(link.intf1.name.split('-eth')[1])
+                    port2 = int(link.intf2.name.split('-eth')[1])
+                except:
+                    # Si no se puede extraer el puerto, usar contador
+                    if switch1_id not in switch_port_counter:
+                        switch_port_counter[switch1_id] = 1
+                    if switch2_id not in switch_port_counter:
+                        switch_port_counter[switch2_id] = 1
+                   
+                    port1 = switch_port_counter[switch1_id]
+                    port2 = switch_port_counter[switch2_id]
+                   
+                    switch_port_counter[switch1_id] += 1
+                    switch_port_counter[switch2_id] += 1
+               
+                # Guardar mapeo de puertos bidireccional
+                self.port_mappings[(switch1_id, switch2_id)] = port1
+                self.port_mappings[(switch2_id, switch1_id)] = port2
+               
+                # Actualizar informacion de switches
+                self.topology_info['switches'][switch1_id]['ports'][port1] = switch2_id
+                self.topology_info['switches'][switch2_id]['ports'][port2] = switch1_id
+                self.topology_info['switches'][switch1_id]['connected_switches'].append(switch2_id)
+                self.topology_info['switches'][switch2_id]['connected_switches'].append(switch1_id)
+               
+                # Informacion del enlace
+                link_info = {
+                    'switch1': switch1_id,
+                    'switch2': switch2_id,
+                    'port1': port1,
+                    'port2': port2,
+                    'bandwidth': getattr(link, 'bw', 1000),  # Ancho de banda por defecto
+                    'delay': getattr(link, 'delay', '1ms'),
+                    'weight': self.graph.get(switch1_id, {}).get(switch2_id, 1.0)
+                }
+                self.topology_info['links'].append(link_info)
+       
+        info("*** Mapeado {} enlaces entre switches\n".format(len(self.port_mappings)//2))
+        return self.port_mappings
+   
+    def get_route_with_ports(self, src, dst):
+        """Obtener ruta con informacion de puertos para instalar reglas de flujo"""
+        path, distance = self.get_shortest_path(src, dst)
+       
+        if not path or len(path) < 2:
+            return None
+       
+        route_with_ports = []
+       
+        for i in range(len(path) - 1):
+            current_switch = path[i]
+            next_switch = path[i + 1]
+           
+            # Obtener puerto de salida
+            out_port = self.port_mappings.get((current_switch, next_switch))
+           
+            route_info = {
+                'switch': current_switch,
+                'next_switch': next_switch,
+                'out_port': out_port,
+                'distance_to_dest': distance
+            }
+            route_with_ports.append(route_info)
+       
+        return {
+            'path': path,
+            'total_distance': distance,
+            'total_hops': len(path) - 1,
+            'route_details': route_with_ports
+        }
+   
+    def generate_flow_rules(self, src_host_ip, dst_host_ip):
+        """Generar reglas de flujo OpenFlow para una comunicacion especifica"""
+        # Extraer switches de las IPs (asumiendo formato 10.0.X.Y)
+        src_switch = int(src_host_ip.split('.')[2])
+        dst_switch = int(dst_host_ip.split('.')[2])
+       
+        route_info = self.get_route_with_ports(src_switch, dst_switch)
+       
+        if not route_info:
+            return None
+       
+        flow_rules = []
+       
+        for route_detail in route_info['route_details']:
+            switch_id = route_detail['switch']
+            out_port = route_detail['out_port']
+           
+            # Regla de flujo basica (formato para RYU)
+            flow_rule = {
+                'switch_id': switch_id,
+                'priority': 100,
+                'match': {
+                    'ipv4_src': src_host_ip.split('/')[0],
+                    'ipv4_dst': dst_host_ip.split('/')[0],
+                    'eth_type': 0x0800  # IPv4
+                },
+                'actions': [
+                    {'type': 'OUTPUT', 'port': out_port}
+                ],
+                'idle_timeout': 300,
+                'hard_timeout': 0
+            }
+            flow_rules.append(flow_rule)
+       
+        return {
+            'src_host': src_host_ip,
+            'dst_host': dst_host_ip,
+            'path': route_info['path'],
+            'total_hops': route_info['total_hops'],
+            'flow_rules': flow_rules
+        }
+   
+    def print_port_mappings(self):
+        """Imprimir mapeo de puertos"""
+        print("\n=== MAPEO DE PUERTOS ENTRE SWITCHES ===")
+        print("{:<15} {:<15} {:<10}".format('Switch Origen', 'Switch Destino', 'Puerto'))
+        print("-" * 45)
+       
+        processed_pairs = set()
+        for (src, dst), port in sorted(self.port_mappings.items()):
+            if (dst, src) not in processed_pairs:
+                reverse_port = self.port_mappings.get((dst, src), 'N/A')
+                print("s{:<14} s{:<14} {:<5} (s{}->s{}: {})".format(src, dst, port, dst, src, reverse_port))
+                processed_pairs.add((src, dst))
+   
+    def print_routing_table(self):
+        """Imprimir tabla de enrutamiento"""
+        print("\n=== TABLA DE ENRUTAMIENTO ({}) ===".format(self.routing_algorithm.upper()))
+        print("{:<8} {:<8} {:<10} {:<7} {}".format('Origen', 'Destino', 'Distancia', 'Saltos', 'Ruta'))
+        print("-" * 70)
+       
+        for src in sorted(self.nodes):
+            for dst in sorted(self.nodes):
+                if src != dst:
+                    path, distance = self.get_shortest_path(src, dst)
+                    if path:
+                        path_str = " -> ".join(["s{}".format(node) for node in path])
+                        hops = len(path) - 1
+                        print("s{:<7} s{:<7} {:<10.1f} {:<7} {}".format(src, dst, distance, hops, path_str))
+                    else:
+                        print("s{:<7} s{:<7} {:<10} {:<7} {}".format(src, dst, 'INF', 'INF', 'Sin ruta'))
+
+class GeantTopoExtended(Topo):
+    """Topologia GEANT Extendida con 43 switches y 2 hosts por switch + Floyd-Warshall"""
+   
+    def __init__(self):
+        # Initialize topology
+        Topo.__init__(self)
+       
+        # Inicializar calculadora Floyd-Warshall
+        self.floyd_warshall = FloydWarshallCalculator()
+       
+        # Configuracion de hosts VLC
+        self.vlc_servers = []  # Lista de hosts VLC (ej: ['h1_1', 'h20_2', 'h35_1'])
+       
+        # Crear 43 switches (1-43)
+        switches = {}
+        for i in range(1, 44):  # Switches 1-43
+            switches[i] = self.addSwitch('s{}'.format(i), protocols='OpenFlow13')
+       
+        # Anadir dos hosts por cada switch con configuracion simple
+        for i in range(1, 44):  # Switches 1-43
+            host1 = self.addHost('h{}_1'.format(i),
+                               ip="10.0.{}.1/24".format(i),
+                               mac="00:00:00:{:02d}:01:01".format(i),
+                               defaultRoute=None)
+            host2 = self.addHost('h{}_2'.format(i),
+                               ip="10.0.{}.2/24".format(i),
+                               mac="00:00:00:{:02d}:01:02".format(i),
+                               defaultRoute=None)
+            # Conectar cada host a su switch correspondiente
+            self.addLink(switches[i], host1, bw=1000)
+            self.addLink(switches[i], host2, bw=1000)
+       
+        # Funcion para calcular el peso basado en el ancho de banda
+        def calculate_weight(bandwidth_mbps):
+            # Peso inversamente proporcional al ancho de banda
+            # Mas ancho de banda = menor peso = ruta preferida
+            return 1000.0 / bandwidth_mbps
+       
+        # Enlaces de 100 Gbps (10000 Mbps) - peso mas bajo
+        links_100g = [
+            (6, 20), (6, 24), (5, 24), (24, 32), (42, 43),
+            (32, 27), (27, 33), (30, 20), (20, 24), (21, 30), (21, 17),
+            (17, 18), (18, 22), (22, 26), (22, 21), (22, 30), (26, 21),
+            (21, 34), (34, 30), (30, 28), (30, 33), (30, 36), (36, 41),
+            (36, 42), (41, 42), (42, 43)
+        ]
+       
+        # Enlaces de 10 Gbps (1000 Mbps) - peso medio
+        links_10g = [
+            (1, 6), (5, 4), (4, 32),
+            (2, 32), (31, 32), (2, 30), (33, 36), (36, 40), (33, 25),
+            (25, 30), (6, 7), (7, 21), (21, 18), (21, 29), (21, 19),
+            (28, 22), (22, 15), (22, 19), (22, 12), (12, 21), (8, 22),
+            (8, 30), (30, 39), (39, 38), (38, 37), (37, 34)
+        ]
+       
+        # Enlaces de 1-9 Gbps (500 Mbps) - peso mas alto
+        links_1_9g = [
+            (6, 10), (32, 33), (24, 27),
+            (32, 40), (32, 3), (3, 30), (40, 32), (29, 34), (30, 9),
+            (30, 16), (34, 29), (34, 35), (16, 22), (13, 22), (22, 14), (21, 11),
+            (11, 19), (11, 12), (12, 19), (19, 23)
+        ]
+       
+        # Agregar enlaces con sus respectivos anchos de banda y calcular pesos
+        info("*** Anadiendo enlaces de 100Gbps...\n")
+        weight_100g = calculate_weight(10000)  # 0.1
+        for link in links_100g:
+            self.addLink(switches[link[0]], switches[link[1]], bw=10000, delay='1ms', loss=0)
+            self.floyd_warshall.add_edge(link[0], link[1], weight_100g)
+       
+        info("*** Anadiendo enlaces de 10Gbps...\n")
+        weight_10g = calculate_weight(1000)  # 1.0
+        for link in links_10g:
+            self.addLink(switches[link[0]], switches[link[1]], bw=1000, delay='2ms', loss=0)
+            self.floyd_warshall.add_edge(link[0], link[1], weight_10g)
+       
+        info("*** Anadiendo enlaces de 1-9Gbps...\n")
+        weight_1_9g = calculate_weight(500)  # 2.0
+        for link in links_1_9g:
+            self.addLink(switches[link[0]], switches[link[1]], bw=500, delay='5ms', loss=0)
+            self.floyd_warshall.add_edge(link[0], link[1], weight_1_9g)
+       
+        # Calcular rutas mas cortas usando Floyd-Warshall
+        info("*** Calculando rutas mas cortas con Floyd-Warshall...\n")
+        self.floyd_warshall.calculate_shortest_paths()
+       
+        info("*** Topologia GEANT Extendida creada con 43 switches\n")
+        info("*** Total de enlaces anadidos: {}\n".format(len(links_100g) + len(links_10g) + len(links_1_9g)))
+        info("*** Enlaces 100Gbps: {} (peso: {:.1f})\n".format(len(links_100g), weight_100g))
+        info("*** Enlaces 10Gbps: {} (peso: {:.1f})\n".format(len(links_10g), weight_10g))
+        info("*** Enlaces 1-9Gbps: {} (peso: {:.1f})\n".format(len(links_1_9g), weight_1_9g))
+   
+    def get_floyd_warshall_calculator(self):
+        """Obtener la instancia del calculadora Floyd-Warshall"""
+        return self.floyd_warshall
+   
+    def save_topology_data(self, filename="geant_topology.json"):
+        """Guardar datos de topologia y rutas en archivo JSON"""
+        all_paths = self.floyd_warshall.get_all_shortest_paths()
+       
+        topology_data = {
+            'nodes': list(self.floyd_warshall.nodes),
+            'edges': [],
+            'shortest_paths': all_paths,
+            'port_mappings': {"{}-{}".format(k[0], k[1]): v for k, v in self.floyd_warshall.port_mappings.items()},
+            'topology_info': self.floyd_warshall.topology_info,
+            'statistics': {
+                'total_nodes': len(self.floyd_warshall.nodes),
+                'total_edges': len(self.floyd_warshall.graph),
+                'total_links': len(self.floyd_warshall.port_mappings) // 2,
+                'avg_distance': 0,
+                'max_distance': 0,
+                'min_distance': float('inf')
+            },
+            'vlc_servers': self.vlc_servers,
+            'routing_algorithm': self.floyd_warshall.routing_algorithm  # MODIFICADO: Anadir algoritmo actual
+        }
+       
+        # Agregar informacion de aristas con puertos
+        for src in self.floyd_warshall.graph:
+            for dst in self.floyd_warshall.graph[src]:
+                if src < dst:  # Evitar duplicados en grafo no dirigido
+                    edge_info = {
+                        'source': src,
+                        'target': dst,
+                        'weight': self.floyd_warshall.graph[src][dst],
+                        'port_src_to_dst': self.floyd_warshall.port_mappings.get((src, dst)),
+                        'port_dst_to_src': self.floyd_warshall.port_mappings.get((dst, src))
+                    }
+                    topology_data['edges'].append(edge_info)
+       
+        # Calcular estadisticas
+        distances = []
+        for src in all_paths:
+            for dst in all_paths[src]:
+                dist = all_paths[src][dst]['distance']
+                if dist != float('inf'):
+                    distances.append(dist)
+                    topology_data['statistics']['max_distance'] = max(
+                        topology_data['statistics']['max_distance'], dist)
+                    topology_data['statistics']['min_distance'] = min(
+                        topology_data['statistics']['min_distance'], dist)
+       
+        if distances:
+            topology_data['statistics']['avg_distance'] = sum(distances) / len(distances)
+       
+        # Guardar en archivo
+        with open(filename, 'w') as f:
+            json.dump(topology_data, f, indent=2)
+       
+        info("*** Datos de topologia con puertos guardados en {}\n".format(filename))
+        return topology_data
+   
+    def set_vlc_servers(self, server_list):
+        """Establecer los hosts que actuaran como servidores VLC (1-3 hosts)"""
+        if len(server_list) < 1 or len(server_list) > 3:
+            raise ValueError("Debe especificar entre 1 y 3 servidores VLC")
+       
+        # Validar que los hosts existen y tienen formato correcto
+        valid_hosts = []
+        for host in server_list:
+            if not re.match(r'^h\d{1,2}_[12]$', host):
+                raise ValueError("Formato de host invalido: {}. Debe ser hX_Y (ej: h1_1)".format(host))
+           
+            switch_id = int(host.split('_')[0][1:])
+            host_num = int(host.split('_')[1])
+           
+            if switch_id < 1 or switch_id > 43 or host_num < 1 or host_num > 2:
+                raise ValueError("Host {} no existe en la topologia (rango valido: h1_1 a h43_2)".format(host))
+           
+            valid_hosts.append(host)
+       
+        self.vlc_servers = valid_hosts
+        info("*** Servidores VLC configurados: {}\n".format(self.vlc_servers))
+   
+    def get_vlc_servers(self):
+        """Obtener la lista actual de servidores VLC"""
+        return self.vlc_servers
+   
+    def configure_vlc_servers(self, net):
+        """Configurar los hosts VLC en la red Mininet"""
+        if not self.vlc_servers:
+            info("*** No hay servidores VLC configurados\n")
+            return
+       
+        info("*** Configurando servidores VLC: {}\n".format(self.vlc_servers))
+       
+        for host_name in self.vlc_servers:
+            host = net.get(host_name)
+            if host:
+                # Comando para iniciar VLC como servidor (ejemplo)
+                vlc_cmd = (
+                    "cvlc -vvv --loop /path/to/video.mp4 "
+                    "--sout '#transcode{{vcodec=h264}}:standard{{access=http,mux=ts,dst=:8080}}' &"
+                )
+               
+                info("*** Iniciando servidor VLC en {}\n".format(host_name))
+                host.cmd(vlc_cmd)
+            else:
+                info("*** ERROR: Host {} no encontrado\n".format(host_name))
+   
+    def stop_vlc_servers(self, net):
+        """Detener servidores VLC"""
+        for host_name in self.vlc_servers:
+            host = net.get(host_name)
+            if host:
+                host.cmd('pkill vlc')
+
+def run_geant_network_extended(controller_ip='127.0.0.1', controller_port=6653):
+    """Funcion principal para ejecutar la red GEANT extendida con Floyd-Warshall"""
+    info("*** Creando la topologia GEANT Extendida (43 switches) con Floyd-Warshall\n")
+    topo = GeantTopoExtended()
+   
+    info("*** Conectando al controlador RYU en {}:{}\n".format(controller_ip, controller_port))
+    controller = RemoteController('c0', ip=controller_ip, port=controller_port)
+   
+    info("*** Iniciando Mininet\n")
+    net = Mininet(
+        topo=topo,
+        switch=OVSKernelSwitch,
+        controller=controller,
+        link=TCLink,
+        autoSetMacs=True,
+        autoStaticArp=False
+    )
+   
+    # Crear aplicacion Flask para la API de VLC
+    app = Flask(__name__)
+
+    @app.route('/vlc/servers', methods=['GET', 'POST'])
+    def handle_vlc_servers():
+        if request.method == 'GET':
+            servers = topo.get_vlc_servers()
+            return jsonify({'vlc_servers': servers})
+        elif request.method == 'POST':
+            try:
+                data = request.get_json()
+                servers = data.get('vlc_servers', [])
+               
+                # Validar que hay entre 1 y 3 hosts
+                if len(servers) < 1 or len(servers) > 3:
+                    return jsonify({'error': 'Debe especificar entre 1 y 3 servidores VLC'}), 400
+                   
+                topo.set_vlc_servers(servers)
+                topo.configure_vlc_servers(net)
+                return jsonify({
+                    'message': 'Servidores VLC configurados',
+                    'vlc_servers': servers
+                }), 200
+            except ValueError as e:
+                return jsonify({'error': str(e)}), 400
+            except Exception as e:
+                return jsonify({'error': 'Error inesperado: {}'.format(str(e))}), 500
+
+    # MODIFICADO: Anadir endpoint para cambiar algoritmo de enrutamiento
+    @app.route('/routing/algorithm', methods=['GET', 'POST'])
+    def handle_routing_algorithm():
+        fw_calc = topo.get_floyd_warshall_calculator()
+       
+        if request.method == 'GET':
+            return jsonify({
+                'current_algorithm': fw_calc.routing_algorithm,
+                'available_algorithms': ['floyd_warshall', 'round_robin', 'weighted_round_robin']
+            })
+       
+        elif request.method == 'POST':
+            try:
+                data = request.get_json()
+                algorithm = data.get('algorithm')
+               
+                if fw_calc.set_routing_algorithm(algorithm):
+                    return jsonify({
+                        'message': 'Algoritmo cambiado a {}'.format(algorithm),
+                        'current_algorithm': fw_calc.routing_algorithm
+                    }), 200
+                else:
+                    return jsonify({
+                        'error': 'Algoritmo no valido. Opciones: floyd_warshall, round_robin, weighted_round_robin'
+                    }), 400
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+   
+    # Iniciar servidor Flask en un hilo separado
+    flask_thread = Thread(target=lambda: app.run(host='0.0.0.0', port=8080, threaded=True))
+    flask_thread.daemon = True
+    flask_thread.start()
+   
+    info("*** Iniciando la red\n")
+    net.start()
+   
+    # Configurar servidores VLC si existen
+    topo.configure_vlc_servers(net)
+   
+    # Configurar OpenFlow 1.3 explicitamente
+    info("*** Configurando OpenFlow version 1.3\n")
+    for switch in net.switches:
+        switch.cmd('ovs-vsctl set bridge %s protocols=OpenFlow13' % switch.name)
+   
+    info("*** Esperando a que los switches se conecten...\n")
+    time.sleep(10)
+   
+    # Configuracion de hosts
+    info("*** Configurando hosts:\n")
+    for i in range(1, 44):
+        for j in [1, 2]:
+            host = net.get('h{}_{}'.format(i, j))
+            if host:
+                host.cmd('ip addr flush dev h{}_{}-eth0'.format(i, j))
+                host.cmd('ip route flush dev h{}_{}-eth0'.format(i, j))
+                host.cmd('ip addr add 10.0.{}.{}/24 dev h{}_{}-eth0'.format(i, j, i, j))
+                host.cmd('ip link set dev h{}_{}-eth0 up'.format(i, j))
+                host.setDefaultRoute('dev h{}_{}-eth0'.format(i, j))
+                host.cmd('ip neigh flush all')
+                host.cmd('arp -d -a 2>/dev/null || true')
+                host.cmd('sysctl -w net.ipv6.conf.all.disable_ipv6=1 2>/dev/null')
+                host.cmd('sysctl -w net.ipv6.conf.default.disable_ipv6=1 2>/dev/null')
+                host.cmd('sysctl -w net.ipv6.conf.lo.disable_ipv6=1 2>/dev/null')
+                if i <= 5:  # Solo mostrar los primeros para no sobrecargar
+                    info("*** Configurado {} con IP 10.0.{}.{}/24\n".format(host.name, i, j))
+   
+    # Obtener calculadora Floyd-Warshall y extraer puertos
+    info("*** Extrayendo mapeo de puertos de la red...\n")
+    fw_calc = topo.get_floyd_warshall_calculator()
+    fw_calc.extract_port_mappings_from_net(net)
+   
+    # Mostrar mapeo de puertos
+    fw_calc.print_port_mappings()
+   
+    # Mostrar tabla de enrutamiento
+    fw_calc.print_routing_table()
+   
+    # Guardar datos de topologia con puertos
+    topology_data = topo.save_topology_data()
+   
+    # Mostrar ejemplos de rutas mas cortas con puertos
+    info("\n*** EJEMPLOS DE RUTAS CON INFORMACION DE PUERTOS:\n")
+    test_routes = [(1, 43), (1, 20), (6, 32), (10, 40), (5, 35)]
+   
+    for src, dst in test_routes:
+        route_info = fw_calc.get_route_with_ports(src, dst)
+        if route_info:
+            path_str = " -> ".join(["s{}".format(node) for node in route_info['path']])
+            info("*** s{} a s{}: {}\n".format(src, dst, path_str))
+            info("    Distancia: {:.2f}, Saltos: {}\n".format(route_info['total_distance'], route_info['total_hops']))
+            info("    Detalles de enrutamiento:\n")
+            for detail in route_info['route_details']:
+                info("      s{} -> s{} via puerto {}\n".format(detail['switch'], detail['next_switch'], detail['out_port']))
+            info("\n")
+   
+    # Ejemplos de generacion de reglas de flujo
+    info("*** EJEMPLOS DE REGLAS DE FLUJO GENERADAS:\n")
+    example_flows = [
+        ("10.0.1.1", "10.0.43.1"),
+        ("10.0.6.1", "10.0.32.2")
+    ]
+   
+    for src_ip, dst_ip in example_flows:
+        flow_info = fw_calc.generate_flow_rules(src_ip, dst_ip)
+        if flow_info:
+            info("*** Flujo {} -> {}:\n".format(src_ip, dst_ip))
+            info("    Ruta: {}\n".format(' -> '.join(['s{}'.format(s) for s in flow_info['path']])))
+            info("    Reglas de flujo a instalar: {}\n".format(len(flow_info['flow_rules'])))
+            for i, rule in enumerate(flow_info['flow_rules']):
+                info("      Switch s{}: output puerto {}\n".format(rule['switch_id'], rule['actions'][0]['port']))
+   
+    # Verificar conexion del controlador
+    info("*** Verificando conexion del controlador\n")
+    connected_switches = 0
+    for switch in net.switches:
+        result = switch.cmd('ovs-vsctl show')
+        if 'is_connected: true' in result:
+            connected_switches += 1
+   
+    info("*** {}/{} switches conectados al controlador\n".format(connected_switches, len(net.switches)))
+   
+    if connected_switches == 0:
+        info("*** ADVERTENCIA: Ningun switch conectado al controlador!\n")
+        info("*** Verifica que RYU este ejecutandose en {}:{}\n".format(controller_ip, controller_port))
+    else:
+        info("*** !Controlador conectado exitosamente!\n")
+   
+    time.sleep(5)
+   
+    # Pruebas de conectividad siguiendo rutas optimas
+    info("\n*** PROBANDO CONECTIVIDAD CON RUTAS FLOYD-WARSHALL:\n")
+   
+    # Prueba 1: Conectividad local
+    h1_1 = net.get('h1_1')
+    h1_2 = net.get('h1_2')
+    if h1_1 and h1_2:
+        info("*** Prueba local (h1_1 -> h1_2): ")
+        result = h1_1.cmd('ping -c 3 -W 5 10.0.1.2')
+        if '3 received' in result or '2 received' in result:
+            info("OK\n")
+        else:
+            info("FAILED\n")
+   
+    # Prueba 2: Ruta optima segun Floyd-Warshall
+    h1_1 = net.get('h1_1')
+    h43_1 = net.get('h43_1')
+    if h1_1 and h43_1:
+        path, distance = fw_calc.get_shortest_path(1, 43)
+        if path:
+            path_str = " -> ".join(["s{}".format(node) for node in path])
+            info("*** Ruta optima s1->s43: {} (distancia: {:.2f})\n".format(path_str, distance))
+            info("*** Prueba remota (h1_1 -> h43_1): ")
+            result = h1_1.cmd('ping -c 2 -W 10 10.0.43.1')
+            if '2 received' in result or '1 received' in result:
+                info("OK\n")
+            else:
+                info("TIMEOUT\n")
+   
+    info("\n*** COMANDOS UTILES CON FLOYD-WARSHALL Y PUERTOS:\n")
+    info("*** - Ver rutas: ya calculadas y mostradas arriba\n")
+    info("*** - Mapeo de puertos: ya extraido automaticamente\n")
+    info("*** - Datos guardados en: geant_topology.json\n")
+    info("*** - Reglas de flujo: ejemplos generados arriba\n")
+    info("*** - Pruebas sugeridas basadas en rutas optimas:\n")
+   
+    for src, dst in test_routes:
+        route_info = fw_calc.get_route_with_ports(src, dst)
+        if route_info and len(route_info['path']) > 1:
+            info("***   h{}_1 ping h{}_1  # Ruta: {}\n".format(src, dst, ' -> '.join(['s{}'.format(n) for n in route_info['path']])))
+   
+    info("\n*** COMANDOS PARA GESTIONAR VLC:\n")
+    info("*** - Configurar servidores: curl -X POST http://127.0.0.1:8080/vlc/servers -d '{{\"vlc_servers\":[\"hX_Y\"]}'\n")
+    info("***   (Donde X es 1-43, Y es 1-2, y puede especificar 1-3 hosts)\n")
+    info("*** - Ejemplos validos:\n")
+    info("***   1 host: [\"h1_1\"]\n")
+    info("***   2 hosts: [\"h1_1\",\"h20_2\"]\n")
+    info("***   3 hosts: [\"h1_1\",\"h20_2\",\"h43_1\"]\n")
+    info("*** - Ver servidores: curl http://127.0.0.1:8080/vlc/servers\n")
+    info("*** - Probar streaming: hX_Y cvlc http://<vlc_server>:8080\n")
+   
+    # MODIFICADO: Anadir información sobre los algoritmos de enrutamiento
+    info("\n*** COMANDOS PARA GESTIONAR ALGORITMOS DE ENRUTAMIENTO:\n")
+    info("*** - Ver algoritmo actual: curl http://127.0.0.1:8080/routing/algorithm\n")
+    info("*** - Cambiar a Floyd-Warshall: curl -X POST http://127.0.0.1:8080/routing/algorithm -d '{\"algorithm\":\"floyd_warshall\"}'\n")
+    info("*** - Cambiar a Round Robin: curl -X POST http://127.0.0.1:8080/routing/algorithm -d '{\"algorithm\":\"round_robin\"}'\n")
+    info("*** - Cambiar a Weighted Round Robin: curl -X POST http://127.0.0.1:8080/routing/algorithm -d '{\"algorithm\":\"weighted_round_robin\"}'\n")
+   
+    info("\n*** INFORMACION ADICIONAL DISPONIBLE:\n")
+    info("*** - Mapeo de puertos: {} enlaces mapeados\n".format(len(fw_calc.port_mappings)//2))
+    info("*** - Switches conectados: {}\n".format(len(fw_calc.topology_info.get('switches', {}))))
+    info("*** - Enlaces totales: {}\n".format(len(fw_calc.topology_info.get('links', []))))
+    info("*** - Archivo JSON contiene: topologia, rutas, puertos y reglas de flujo\n")
+   
+    CLI(net)
+   
+    info("*** Deteniendo servidores VLC...\n")
+    topo.stop_vlc_servers(net)
+   
+    info("*** Deteniendo la red\n")
+    net.stop()
+
+if __name__ == '__main__':
+    setLogLevel('info')
+   
+    import sys
+    import argparse
+   
+    parser = argparse.ArgumentParser(description='Topologia GEANT Extendida con Floyd-Warshall')
+    parser.add_argument('--controller', '-c', default='127.0.0.1',
+                        help='IP del controlador RYU (default: 127.0.0.1)')
+    parser.add_argument('--port', '-p', type=int, default=6653,
+                        help='Puerto del controlador RYU (default: 6653)')
+   
+    args = parser.parse_args()
+   
+    try:
+        run_geant_network_extended(args.controller, args.port)
+    except KeyboardInterrupt:
+        info("\n*** Interrumpido por el usuario\n")
+    except Exception as e:
+        info("*** Error: {}\n".format(e))
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
