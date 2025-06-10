@@ -1,0 +1,1633 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from ryu.base import app_manager
+from ryu.controller import ofp_event
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
+from ryu.controller.handler import set_ev_cls
+from ryu.ofproto import ofproto_v1_3
+from ryu.lib.packet import packet
+from ryu.lib.packet import ethernet
+from ryu.lib.packet import ether_types
+from ryu.lib.packet import ipv4
+from ryu.lib.packet import arp
+from ryu.lib.packet import icmp
+from ryu.app.wsgi import WSGIApplication, ControllerBase, route
+from webob import Response
+import time
+import json
+import re
+import pymysql
+from pymysql import cursors
+import threading
+from datetime import datetime
+
+# Configuración del servidor WSGI
+WSGI_HOST = '192.168.1.10'  # Cambia esto a la IP deseada
+WSGI_PORT = 8080  # Puerto por defecto para la API REST
+
+class GeantSdnController(app_manager.RyuApp):
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _CONTEXTS = {'wsgi': WSGIApplication}
+
+    def __init__(self, *args, **kwargs):
+        super(GeantSdnController, self).__init__(*args, **kwargs)
+       
+        # Configuración de MySQL
+        self.db_config = {
+            'host': 'localhost',
+            'user': 'usuario',       # Usuario creado
+            'password': 'Juansanchez123@', # Contraseña nueva
+            'database': 'sdn_db',
+            'cursorclass': cursors.DictCursor
+        }
+        self.db_connection = None
+        self.db_lock = threading.Lock()
+       
+        # Inicializar conexión a MySQL
+        self.init_db_connection()
+
+        # Configurar WSGI para escuchar en la IP específica
+        wsgi = kwargs['wsgi']
+        wsgi.config = {
+            'wsgi_host': WSGI_HOST,
+            'wsgi_port': WSGI_PORT
+        }      
+        # Tabla de direcciones MAC por switch
+        self.mac_to_port = {}
+        # Tabla ARP global
+        self.ip_to_mac = {}
+        self.mac_to_ip = {}
+        # Información de switches
+        self.datapaths = {}
+        # Estadísticas
+        self.packet_count = 0
+        self.arp_requests = 0
+        self.arp_replies = 0
+       
+        # Topología de red GEANT actualizada
+        self.topology = self._build_topology()
+       
+        # Configuración de algoritmo de ruteo
+        self.routing_algorithm = 'dijkstra'  # Por defecto Dijkstra
+        self.routing_algorithms = ['dijkstra', 'floyd_warshall', 'round_robin', 'weighted_round_robin']  # MODIFICADO
+       
+        # Para visualización de Dijkstra
+        self.dijkstra_debug = True
+        self.dijkstra_log = []
+       
+        # Para Floyd-Warshall
+        self.fw_distances = {}
+        self.fw_next_hop = {}
+        self.fw_calculated = False
+       
+        # Inicializar caché de rutas
+        self.route_cache = {}
+       
+        # Configuración de hosts VLC
+        self.vlc_servers = []  # Lista de hosts VLC (ej: ['h1_1', 'h20_2', 'h35_1'])
+       
+        # Para Round Robin y Weighted Round Robin
+        self.rr_index = {}          # MODIFICADO: Para llevar el índice de RR por switch
+        self.wrr_weights = {}        # MODIFICADO: Para almacenar pesos por switch
+        self.wrr_current = {}        # MODIFICADO: Contador actual para WRR
+       
+        # Inicializar API REST
+        wsgi = kwargs['wsgi']
+        wsgi.register(GeantRestApi, {'sdn_app': self})
+       
+        # Calcular Floyd-Warshall al inicio
+        self.calculate_floyd_warshall()
+
+    def init_db_connection(self):
+        """Inicializar conexión a MySQL"""
+        try:
+            self.db_connection = pymysql.connect(**self.db_config)
+            self.logger.info("✅ Conexión a MySQL establecida correctamente")
+            self.initialize_db_tables()
+        except Exception as e:
+            self.db_connection = None
+
+    def initialize_db_tables(self):
+        """Inicializar tablas en MySQL si no existen"""
+        if not self.db_connection:
+            return
+           
+        try:
+            with self.db_connection.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS flow_rules (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        action_type VARCHAR(10) NOT NULL,
+                        switch_dpid VARCHAR(50) NOT NULL,
+                        rule_data JSON NOT NULL,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS operations (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        operation_type VARCHAR(50) NOT NULL,
+                        data JSON NOT NULL,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+            self.db_connection.commit()
+            self.logger.info("✅ Tablas MySQL inicializadas correctamente")
+        except Exception as e:
+            self.logger.error(f"⚠️ Error al inicializar tablas MySQL: {str(e)}")
+
+    def log_operation(self, operation_type, data):
+        """Registrar una operación en MySQL"""
+        if not self.db_connection:
+            return
+           
+        try:
+            with self.db_lock:
+                with self.db_connection.cursor() as cursor:
+                    cursor.execute(
+                        'INSERT INTO operations (operation_type, data, timestamp) VALUES (%s, %s, NOW())',
+                        (operation_type, json.dumps(data))
+                    )
+                self.db_connection.commit()
+        except Exception as e:
+            self.logger.error(f"⚠️ Error al registrar operación en MySQL: {str(e)}")
+            # Intentar reconectar
+            try:
+                self.db_connection.ping(reconnect=True)
+            except:
+                self.init_db_connection()
+
+    def log_flow_rule(self, action_type, switch_dpid, rule_data):
+        """Registrar una regla de flujo en MySQL"""
+        if not self.db_connection:
+            return
+           
+        try:
+            with self.db_lock:
+                with self.db_connection.cursor() as cursor:
+                    cursor.execute(
+                        'INSERT INTO flow_rules (action_type, switch_dpid, rule_data, timestamp) VALUES (%s, %s, %s, NOW())',
+                        (action_type, str(switch_dpid), json.dumps(rule_data))
+                    )
+                self.db_connection.commit()
+        except Exception as e:
+            self.logger.error(f"⚠️ Error al registrar regla de flujo en MySQL: {str(e)}")
+            # Intentar reconectar
+            try:
+                self.db_connection.ping(reconnect=True)
+            except:
+                self.init_db_connection()
+
+    def close(self):
+        """Método llamado cuando la aplicación se cierra"""
+        if self.db_connection:
+            try:
+                self.db_connection.close()
+                self.logger.info("🔌 Conexión a MySQL cerrada correctamente")
+            except Exception as e:
+                self.logger.error(f"⚠️ Error al cerrar conexión MySQL: {str(e)}")
+        super(GeantSdnController, self).close()
+   
+    def set_routing_algorithm(self, algorithm):
+        """Establecer el algoritmo de ruteo a usar"""
+        if algorithm in self.routing_algorithms:
+            self.routing_algorithm = algorithm
+            self.logger.info(f"Algoritmo de ruteo cambiado a: {algorithm}")
+            return True
+        return False
+   
+    def calculate_floyd_warshall(self):
+        """Calcular todas las rutas más cortas usando Floyd-Warshall"""
+        nodes = sorted(self.topology.keys())
+        n = len(nodes)
+       
+        # Inicializar matrices de distancia y próximo salto
+        INF = float('infinity')
+        self.fw_distances = {node: {v: INF for v in nodes} for node in nodes}
+        self.fw_next_hop = {node: {v: None for v in nodes} for node in nodes}
+       
+        # Inicialización
+        for i in nodes:
+            self.fw_distances[i][i] = 0
+            self.fw_next_hop[i][i] = i
+            for j in self.topology[i]:
+                self.fw_distances[i][j] = self.link_weights.get((i, j), 1)
+                self.fw_next_hop[i][j] = j
+       
+        # Algoritmo Floyd-Warshall
+        for k in nodes:
+            for i in nodes:
+                for j in nodes:
+                    if (self.fw_distances[i][k] + self.fw_distances[k][j] < self.fw_distances[i][j]):
+                        self.fw_distances[i][j] = self.fw_distances[i][k] + self.fw_distances[k][j]
+                        self.fw_next_hop[i][j] = self.fw_next_hop[i][k]
+       
+        self.fw_calculated = True
+        self.logger.info("Floyd-Warshall: Todas las rutas más cortas calculadas")
+   
+    def floyd_warshall_shortest_path(self, start, end):
+        """Obtener la ruta más corta usando Floyd-Warshall"""
+        if not self.fw_calculated:
+            self.calculate_floyd_warshall()
+       
+        if start not in self.topology or end not in self.topology:
+            return None, float('infinity')
+       
+        if self.fw_next_hop[start][end] is None:
+            return None, float('infinity')
+       
+        # Reconstruir el camino
+        path = [start]
+        current = start
+       
+        while current != end:
+            current = self.fw_next_hop[current][end]
+            path.append(current)
+       
+        return path, self.fw_distances[start][end]
+   
+    def log_dijkstra_step(self, current, unvisited, distances, previous):
+        """Registrar un paso del algoritmo Dijkstra para visualización"""
+        if not self.dijkstra_debug:
+            return
+           
+        step_info = {
+            'current': current,
+            'unvisited': sorted(unvisited),
+            'distances': {k: v for k, v in distances.items() if v != float('infinity')},
+            'previous': {k: v for k, v in previous.items() if v is not None}
+        }
+        self.dijkstra_log.append(step_info)
+   
+    def print_dijkstra_path(self, start, end, path, distance):
+        """Mostrar información sobre el camino encontrado por Dijkstra"""
+        if not path:
+            self.logger.error(f"No se encontró camino de {start} a {end}")
+            return
+           
+        path_str = " -> ".join(map(str, path))
+        self.logger.info(f"Camino Dijkstra encontrado: {path_str}")
+        self.logger.info(f"Distancia total: {distance}")
+       
+        # Mostrar detalles de cada salto
+        for i in range(len(path)-1):
+            src = path[i]
+            dst = path[i+1]
+            weight = self.link_weights.get((src, dst), "?")
+            self.logger.info(f" Salto {i+1}: {src} -> {dst} (peso: {weight})")
+   
+    def dijkstra_shortest_path(self, start, end):
+        """Implementación de Dijkstra para encontrar el camino más corto con visualización"""
+        if start == end:
+            return [start], 0
+           
+        # Limpiar registro de visualización
+        self.dijkstra_log = []
+       
+        # Inicialización
+        distances = {node: float('infinity') for node in self.topology}
+        distances[start] = 0
+        previous = {node: None for node in self.topology}
+        unvisited = set(self.topology.keys())
+       
+        # Paso inicial
+        self.log_dijkstra_step(None, unvisited, distances, previous)
+       
+        while unvisited:
+            # Encontrar nodo no visitado con menor distancia
+            current = min(unvisited, key=lambda node: distances[node])
+           
+            if distances[current] == float('infinity'):
+                break
+               
+            if current == end:
+                # Reconstruir camino
+                path = []
+                while current is not None:
+                    path.append(current)
+                    current = previous.get(current)
+                path = list(reversed(path))
+               
+                # Registrar y mostrar resultados
+                self.log_dijkstra_step(current, unvisited, distances, previous)
+                if self.dijkstra_debug:
+                    self.print_dijkstra_path(start, end, path, distances[end])
+                    self.logger.debug("Detalles de ejecución Dijkstra:\n" + json.dumps(self.dijkstra_log, indent=2))
+                return path, distances[end]
+               
+            unvisited.remove(current)
+           
+            # Examinar vecinos
+            for neighbor in self.topology.get(current, []):
+                if neighbor in unvisited:
+                    weight = self.link_weights.get((current, neighbor), 1)
+                    alt = distances[current] + weight
+                    if alt < distances[neighbor]:
+                        distances[neighbor] = alt
+                        previous[neighbor] = current
+                        # Registrar paso
+                        self.log_dijkstra_step(current, unvisited, distances, previous)
+       
+        # No se encontró camino
+        self.logger.warning(f"No se encontró camino de {start} a {end}")
+        if self.dijkstra_debug:
+            self.logger.debug("Último estado de Dijkstra:\n" + json.dumps(self.dijkstra_log[-1], indent=2))
+        return None, float('infinity')
+   
+    def _build_topology(self):
+        """Construir la topología GEANT con las conexiones especificadas"""
+        # Enlaces de 100 Gbps - conexiones principales
+        links_100g = [
+            (6, 20), (6, 24), (5, 24), (24, 32), (42, 43),
+            (32, 27), (27, 33), (30, 20), (20, 24), (21, 30),
+            (21, 17), (17, 18), (18, 22), (22, 26), (22, 21),
+            (22, 30), (26, 21), (21, 34), (34, 30), (30, 28),
+            (30, 33), (30, 36), (36, 41), (36, 42), (41, 42), (42, 43)
+        ]
+       
+        # Enlaces de 10 Gbps - conexiones secundarias
+        links_10g = [
+            (1, 6), (5, 4), (4, 32), (2, 32), (31, 32),
+            (2, 30), (33, 36), (36, 40), (33, 25), (25, 30),
+            (6, 7), (7, 21), (21, 18), (21, 29), (21, 19),
+            (28, 22), (22, 15), (22, 19), (22, 12), (12, 21),
+            (8, 22), (8, 30), (30, 39), (39, 38), (38, 37), (37, 34)
+        ]
+       
+        # Enlaces de 1-9 Gbps - conexiones de menor capacidad
+        links_1_9g = [
+            (6, 10), (32, 33), (24, 27), (32, 40), (32, 3),
+            (3, 30), (40, 32), (29, 34), (30, 9), (30, 16),
+            (34, 29), (34, 35), (16, 22), (13, 22), (22, 14),
+            (21, 11), (11, 19), (11, 12), (12, 19), (19, 23)
+        ]
+       
+        # Construir diccionario de adyacencia
+        topology = {}
+        all_links = links_100g + links_10g + links_1_9g
+       
+        # Crear lista de adyacencia bidireccional
+        for src, dst in all_links:
+            if src not in topology:
+                topology[src] = []
+            if dst not in topology:
+                topology[dst] = []
+            if dst not in topology[src]:
+                topology[src].append(dst)
+            if src not in topology[dst]:
+                topology[dst].append(src)
+       
+        # Crear mapeo de pesos para los diferentes tipos de enlaces
+        self.link_weights = {}
+        for src, dst in links_100g:
+            self.link_weights[(src, dst)] = 1  # Peso más bajo para enlaces de alta capacidad
+            self.link_weights[(dst, src)] = 1
+        for src, dst in links_10g:
+            self.link_weights[(src, dst)] = 2  # Peso medio
+            self.link_weights[(dst, src)] = 2
+        for src, dst in links_1_9g:
+            self.link_weights[(src, dst)] = 3  # Peso más alto para enlaces de baja capacidad
+            self.link_weights[(dst, src)] = 3
+       
+        self.logger.info(f"Topología GEANT cargada con {len(all_links)} enlaces")
+        self.logger.info(f"Switches conectados: {sorted(topology.keys())}")
+        return topology
+   
+    def _get_port_mapping(self):
+        """Mapeo de puertos específico para tu topología GEANT"""
+        return {
+            # Ejemplo de mapeos - ajustar según tu configuración real
+            (6, 20): 3, (20, 6): 3,
+            (6, 24): 4, (24, 6): 3,
+            (5, 24): 3, (24, 5): 4,
+            (30, 20): 3, (20, 30): 4,
+            (21, 30): 3, (30, 21): 4,
+            (22, 21): 3, (21, 22): 4,
+            (22, 30): 4, (30, 22): 5,
+        }
+   
+    def find_path_to_switch(self, src_dpid, dst_dpid):
+        """Encontrar el puerto de salida para llegar a otro switch usando el algoritmo seleccionado"""
+        if src_dpid == dst_dpid:
+            return None
+           
+        # Caché de rutas para evitar recalcular
+        route_key = (src_dpid, dst_dpid, self.routing_algorithm)
+        if self.routing_algorithm in ['dijkstra', 'floyd_warshall']:
+            if route_key in self.route_cache:
+                return self.route_cache[route_key]
+       
+        # Usar el algoritmo seleccionado para encontrar el camino más corto
+        if self.routing_algorithm == 'dijkstra':
+            path, distance = self.dijkstra_shortest_path(src_dpid, dst_dpid)
+        elif self.routing_algorithm == 'floyd_warshall':
+            path, distance = self.floyd_warshall_shortest_path(src_dpid, dst_dpid)
+        elif self.routing_algorithm == 'round_robin':
+            # MODIFICADO: Implementación Round Robin
+            neighbors = self.topology.get(src_dpid, [])
+            if not neighbors:
+                self.logger.warning(f"No hay vecinos para switch {src_dpid}")
+                return None
+               
+            # Inicializar índice si no existe
+            if src_dpid not in self.rr_index:
+                self.rr_index[src_dpid] = 0
+               
+            # Obtener el índice actual y calcular el siguiente vecino
+            idx = self.rr_index[src_dpid] % len(neighbors)
+            next_hop = neighbors[idx]
+            self.rr_index[src_dpid] = (self.rr_index[src_dpid] + 1) % len(neighbors)
+            self.logger.info(f"Round Robin: switch {src_dpid} elige vecino {next_hop} (índice {idx})")
+            path = [src_dpid, next_hop]
+        elif self.routing_algorithm == 'weighted_round_robin':
+            # MODIFICADO: Implementación Weighted Round Robin
+            neighbors = self.topology.get(src_dpid, [])
+            if not neighbors:
+                self.logger.warning(f"No hay vecinos para switch {src_dpid}")
+                return None
+               
+            # Inicializar pesos y contador si no existen
+            if src_dpid not in self.wrr_weights:
+                weights = []
+                for neighbor in neighbors:
+                    # Obtener costo del enlace (inverso a la capacidad)
+                    cost = self.link_weights.get((src_dpid, neighbor), 1)
+                    # Mapear costo a peso (mayor capacidad = mayor peso)
+                    if cost == 1:   # 100Gbps
+                        weights.append(3)
+                    elif cost == 2: # 10Gbps
+                        weights.append(2)
+                    elif cost == 3: # 1-9Gbps
+                        weights.append(1)
+                    else:
+                        weights.append(1)
+                self.wrr_weights[src_dpid] = weights
+                self.wrr_current[src_dpid] = 0
+                self.logger.info(f"WRR inicializado para switch {src_dpid}: pesos {weights}")
+               
+            weights = self.wrr_weights[src_dpid]
+            total_weight = sum(weights)
+            if total_weight == 0:
+                self.logger.error(f"WRR: Suma de pesos es 0 para switch {src_dpid}")
+                return None
+               
+            # Calcular siguiente salto usando WRR
+            current = self.wrr_current[src_dpid]
+            current = (current + 1) % total_weight
+            temp = current
+            index = 0
+            for i, w in enumerate(weights):
+                if temp < w:
+                    index = i
+                    break
+                temp -= w
+               
+            next_hop = neighbors[index]
+            self.wrr_current[src_dpid] = current
+            self.logger.info(f"Weighted Round Robin: switch {src_dpid} elige vecino {next_hop} (índice {index}, peso {weights[index]})")
+            path = [src_dpid, next_hop]
+        else:
+            self.logger.error(f"Algoritmo de ruteo desconocido: {self.routing_algorithm}")
+            return None
+           
+        if not path or len(path) < 2:
+            self.logger.warning(f"No se encontró ruta de switch {src_dpid} a {dst_dpid}")
+            return None
+           
+        next_hop = path[1]  # Siguiente salto en el camino
+       
+        # Mapeo de puertos más robusto - usar puerto fijo para conexiones conocidas
+        port_map = self._get_port_mapping()
+        port_key = (src_dpid, next_hop)
+       
+        if port_key in port_map:
+            port = port_map[port_key]
+        else:
+            # Fallback: usar índice del vecino + 3
+            neighbors = self.topology.get(src_dpid, [])
+            if next_hop in neighbors:
+                port = 3 + neighbors.index(next_hop)
+            else:
+                self.logger.warning(f"Next hop {next_hop} no es vecino directo de {src_dpid}")
+                return None
+               
+        self.logger.info(f"Ruta encontrada ({self.routing_algorithm}): {' -> '.join(map(str, path[:3]))}... (puerto: {port})")
+       
+        # Cachear resultado solo para algoritmos estáticos
+        if self.routing_algorithm in ['dijkstra', 'floyd_warshall']:
+            self.route_cache[route_key] = port
+        return port
+   
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        """Configuración inicial del interruptor"""
+        datapath = ev.msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        dpid = datapath.id
+       
+        self.logger.info(f"=== SWITCH CONECTADO: DPID {dpid} ===")
+       
+        # Guardar referencia al datapath
+        self.datapaths[dpid] = datapath
+        self.mac_to_port.setdefault(dpid, {})
+       
+        # Eliminar todos los flujos existentes
+        match = parser.OFPMatch()
+        self.del_flow(datapath, match)
+       
+        # Instalar flow por defecto: enviar al controlador
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+        self.add_flow(datapath, 0, match, actions)
+       
+        self.logger.info(f"Switch {dpid} configurado correctamente")
+   
+    def add_flow(self, datapath, priority, match, actions, buffer_id=None, idle_timeout=60, hard_timeout=0):
+        """Añadir flow al switch"""
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+       
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+       
+        if buffer_id:
+            mod = parser.OFPFlowMod(
+                datapath=datapath, buffer_id=buffer_id, priority=priority,
+                match=match, instructions=inst, idle_timeout=idle_timeout,
+                hard_timeout=hard_timeout
+            )
+        else:
+            mod = parser.OFPFlowMod(
+                datapath=datapath, priority=priority, match=match,
+                instructions=inst, idle_timeout=idle_timeout,
+                hard_timeout=hard_timeout
+            )
+        datapath.send_msg(mod)
+   
+    def del_flow(self, datapath, match):
+        """Eliminar flujos del interruptor"""
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+       
+        mod = parser.OFPFlowMod(
+            datapath=datapath, command=ofproto.OFPFC_DELETE,
+            out_port=ofproto.OFPP_ANY, out_group=ofproto.OFPG_ANY,
+            match=match
+        )
+        datapath.send_msg(mod)
+   
+    def get_switch_for_ip(self, ip):
+        """Determinar switch destino basado en IP (10.0.X.Y -> switch X)"""
+        try:
+            parts = ip.split('.')
+            if len(parts) == 4 and parts[0] == '10' and parts[1] == '0':
+                switch_id = int(parts[2])
+                # Soporta switches según la topología cargada
+                if switch_id in self.topology:
+                    return switch_id
+        except:
+            pass
+        return None
+   
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def packet_in_handler(self, ev):
+        """Manejar paquetes que llegan al controlador"""
+        msg = ev.msg
+        datapath = msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        in_port = msg.match['in_port']
+        dpid = datapath.id
+       
+        self.packet_count += 1
+       
+        pkt = packet.Packet(msg.data)
+        eth = pkt.get_protocols(ethernet.ethernet)[0]
+       
+        # Ignorar LLDP y multidifusión IPv6
+        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
+            return
+        if eth.dst.startswith('33:33:') or eth.dst.startswith('01:00:5e:'):
+            return
+           
+        dst_mac = eth.dst
+        src_mac = eth.src
+       
+        # Log menos verboso pero más informativo
+        if self.packet_count % 100 == 1:  # Cada 100 paquetes
+            self.logger.info(f"Packet #{self.packet_count}: DPID={dpid}, "
+                            f"SRC={src_mac[:8]}..., DST={dst_mac[:8]}..., PORT={in_port}")
+       
+        # Depuración detallada solo para los primeros paquetes
+        if self.packet_count <= 50:
+            self.logger.info(f"Paquete DETALLE #{self.packet_count}: DPID={dpid}, "
+                            f"SRC={src_mac}, DST={dst_mac}, PORT={in_port}, TYPE={hex(eth.ethertype)}")
+       
+        # Aprender dirección MAC
+        if src_mac not in self.mac_to_port[dpid]:
+            self.mac_to_port[dpid][src_mac] = in_port
+            self.logger.info(f"*** APRENDIZAJE: Switch {dpid}, MAC {src_mac} -> Puerto {in_port}")
+       
+        # Manejar ARP
+        if eth.ethertype == ether_types.ETH_TYPE_ARP:
+            return self.handle_arp(datapath, pkt, in_port)
+       
+        # Manejar IP
+        elif eth.ethertype == ether_types.ETH_TYPE_IP:
+            ip_pkt = pkt.get_protocol(ipv4.ipv4)
+            if ip_pkt:
+                # Actualizar tabla IP->MAC
+                if ip_pkt.src not in self.ip_to_mac:
+                    self.ip_to_mac[ip_pkt.src] = src_mac
+                    self.mac_to_ip[src_mac] = ip_pkt.src
+                    self.logger.info(f"*** MAPEO DE IP: {ip_pkt.src} -> {src_mac}")
+               
+                # Determinar puerto de salida
+                out_port = None
+               
+                # 1. Buscar en tabla MAC local primero
+                if dst_mac in self.mac_to_port[dpid]:
+                    out_port = self.mac_to_port[dpid][dst_mac]
+                    self.logger.debug(f"MAC {dst_mac} encontrado localmente en puerto {out_port}")
+               
+                # 2. Si no es local y es tráfico IP, buscar globalmente
+                elif eth.ethertype == ether_types.ETH_TYPE_IP:
+                    ip_pkt = pkt.get_protocol(ipv4.ipv4)
+                    if ip_pkt:
+                        # Buscar la MAC destino en todos los switches
+                        target_mac = self.ip_to_mac.get(ip_pkt.dst)
+                        if target_mac:
+                            # Encontrar en qué switch está esa MAC
+                            target_switch, target_port = self.find_mac_location(target_mac)
+                            if target_switch == dpid:
+                                # Está en este switch pero no lo habíamos aprendido
+                                out_port = target_port
+                            elif target_switch:
+                                # Está en otro switch, encontrar ruta usando el algoritmo seleccionado
+                                out_port = self.find_path_to_switch(dpid, target_switch)
+                                if out_port:
+                                    self.logger.info(f"Routing {ip_pkt.src}->{ip_pkt.dst} "
+                                                    f"desde switch {dpid} hacia switch {target_switch} "
+                                                    f"por puerto {out_port}")
+                       
+                        # Si no conocemos la MAC, pero sabemos que IP debería estar en un switch específico
+                        if not out_port:
+                            dst_switch = self.get_switch_for_ip(ip_pkt.dst)
+                            if dst_switch and dst_switch != dpid:
+                                out_port = self.find_path_to_switch(dpid, dst_switch)
+                                if out_port:
+                                    self.logger.info(f"Routing por topología hacia switch {dst_switch} "
+                                                    f"por puerto {out_port}")
+               
+                # 3. Flood como último recurso (pero con límites)
+                if out_port is None:
+                    # Evitar inundación excesivo - solo para ARP y primeros paquetes
+                    if (eth.ethertype == ether_types.ETH_TYPE_ARP or
+                        dst_mac == "ff:ff:ff:ff:ff:ff" or
+                        self.packet_count <= 100):
+                        out_port = ofproto.OFPP_FLOOD
+                        self.logger.debug(f"Flooding paquete desde {src_mac} hacia {dst_mac}")
+                    else:
+                        # Dejar paquetes desconocidos después de un tiempo
+                        self.logger.warning(f"Caer paquete desconocido {src_mac} -> {dst_mac}")
+                        return
+               
+                actions = [parser.OFPActionOutput(out_port)]
+               
+                # Instalar flow solo si conocemos el puerto exacto (no flood)
+                if out_port != ofproto.OFPP_FLOOD and out_port != ofproto.OFPP_CONTROLLER:
+                    # Flow más específico para evitar conflictos
+                    if eth.ethertype == ether_types.ETH_TYPE_IP:
+                        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+                        if ip_pkt:
+                            # Flow bidireccional para IP con timeout más largo
+                            match = parser.OFPMatch(
+                                eth_type=ether_types.ETH_TYPE_IP,
+                                ipv4_src=ip_pkt.src,
+                                ipv4_dst=ip_pkt.dst
+                            )
+                            self.add_flow(datapath, 20, match, actions, idle_timeout=300)  # 5 minutos
+                           
+                            # Instalar flujo de retorno también
+                            reverse_actions = [parser.OFPActionOutput(in_port)]
+                            reverse_match = parser.OFPMatch(
+                                eth_type=ether_types.ETH_TYPE_IP,
+                                ipv4_src=ip_pkt.dst,
+                                ipv4_dst=ip_pkt.src
+                            )
+                            self.add_flow(datapath, 20, reverse_match, reverse_actions, idle_timeout=300)
+                            self.logger.info(f"*** FLOW IP INSTALADO: {ip_pkt.src}->{ip_pkt.dst} "
+                                            f"puerto {out_port} en switch {dpid}")
+                    else:
+                        # Flow para tráfico no-IP
+                        match = parser.OFPMatch(in_port=in_port, eth_dst=dst_mac)
+                        self.add_flow(datapath, 10, match, actions, idle_timeout=30)
+               
+                # Enviar paquete
+                data = None
+                if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+                    data = msg.data
+               
+                # CORRECCIÓN: Usar la clase correcta para PacketOut
+                out = datapath.ofproto_parser.OFPPacketOut(
+                    datapath=datapath, buffer_id=msg.buffer_id,
+                    in_port=in_port, actions=actions, data=data
+                )
+                datapath.send_msg(out)
+   
+    def find_mac_location(self, mac):
+        """Encontrar en qué switch y puerto está una MAC"""
+        for dpid, mac_table in self.mac_to_port.items():
+            if mac in mac_table:
+                return dpid, mac_table[mac]
+        return None, None
+   
+    def handle_arp(self, datapath, pkt, in_port):
+        """Manejar paquetes ARP de forma más eficiente"""
+        arp_pkt = pkt.get_protocol(arp.arp)
+        if not arp_pkt:
+            return
+           
+        eth_pkt = pkt.get_protocol(ethernet.ethernet)
+        dpid = datapath.id
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+       
+        # Actualizar tablas ARP
+        self.ip_to_mac[arp_pkt.src_ip] = arp_pkt.src_mac
+        self.mac_to_ip[arp_pkt.src_mac] = arp_pkt.src_ip
+       
+        if arp_pkt.opcode == arp.ARP_REQUEST:
+            self.arp_requests += 1
+            self.logger.info(f"*** SOLICITUD ARP #{self.arp_requests}: "
+                            f"¿Quién tiene {arp_pkt.dst_ip}? Dile a {arp_pkt.src_ip}")
+           
+            # Si conocemos la respuesta, responder directamente
+            if arp_pkt.dst_ip in self.ip_to_mac:
+                self.logger.info(f"*** RESPONDIENDO ARP: {arp_pkt.dst_ip} -> {self.ip_to_mac[arp_pkt.dst_ip]}")
+                self.send_arp_reply(datapath, arp_pkt, in_port)
+            else:
+                # Flood ARP de manera más inteligente
+                dst_switch = self.get_switch_for_ip(arp_pkt.dst_ip)
+                if dst_switch and dst_switch != dpid:
+                    # La IP debería estar en otro switch específico
+                    self.forward_arp_to_switch(pkt, dst_switch)
+                else:
+                    # Flood local en este switch
+                    actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+                    self.send_packet_out(datapath, actions, pkt.data, in_port)
+       
+        elif arp_pkt.opcode == arp.ARP_REPLY:
+            self.arp_replies += 1
+            self.logger.info(f"*** RESPUESTA ARP #{self.arp_replies}: "
+                            f"{arp_pkt.src_ip} -> {arp_pkt.src_mac}")
+           
+            # Reenviar la respuesta al solicitante
+            self.forward_arp_reply(datapath, pkt, in_port)
+   
+    def forward_arp_to_switch(self, pkt, target_dpid):
+        """Reenviar ARP request a un switch específico"""
+        if target_dpid in self.datapaths:
+            datapath = self.datapaths[target_dpid]
+            ofproto = datapath.ofproto
+            parser = datapath.ofproto_parser
+           
+            actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+            self.send_packet_out(datapath, actions, pkt.data, ofproto.OFPP_CONTROLLER)
+   
+    def forward_arp_reply(self, datapath, pkt, in_port):
+        """Reenviar respuesta ARP al destino correcto"""
+        arp_pkt = pkt.get_protocol(arp.arp)
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        dpid = datapath.id
+       
+        # Buscar dónde está el destinatario
+        dst_mac = arp_pkt.dst_mac
+        out_port = None
+       
+        # Buscar en tabla MAC local
+        if dst_mac in self.mac_to_port[dpid]:
+            out_port = self.mac_to_port[dpid][dst_mac]
+        else:
+            # Buscar en otros switches
+            target_switch, _ = self.find_mac_location(dst_mac)
+            if target_switch and target_switch != dpid:
+                out_port = self.find_path_to_switch(dpid, target_switch)
+       
+        if out_port is None:
+            out_port = ofproto.OFPP_FLOOD
+       
+        actions = [parser.OFPActionOutput(out_port)]
+        self.send_packet_out(datapath, actions, pkt.data, in_port)
+   
+    def send_packet_out(self, datapath, actions, data, in_port):
+        """Enviar paquete desde el switch"""
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+       
+        # CORRECCIÓN: Usar la clase correcta para PacketOut
+        out = parser.OFPPacketOut(
+            datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
+            in_port=in_port, actions=actions, data=data
+        )
+        datapath.send_msg(out)
+   
+    def send_arp_reply(self, datapath, arp_req, in_port):
+        """Enviar respuesta ARP directamente desde el controlador"""
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+       
+        # Obtener MAC de la IP solicitada
+        target_mac = self.ip_to_mac[arp_req.dst_ip]
+       
+        # Crear respuesta ARP
+        arp_reply = arp.arp(
+            hwtype=arp.ARP_HW_TYPE_ETHERNET,
+            proto=ether_types.ETH_TYPE_IP,
+            hlen=6, plen=4,
+            opcode=arp.ARP_REPLY,
+            src_mac=target_mac,
+            src_ip=arp_req.dst_ip,
+            dst_mac=arp_req.src_mac,
+            dst_ip=arp_req.src_ip
+        )
+       
+        # Crear marco Ethernet
+        eth_reply = ethernet.ethernet(
+            dst=arp_req.src_mac,
+            src=target_mac,
+            ethertype=ether_types.ETH_TYPE_ARP
+        )
+       
+        # Crear y enviar paquete
+        pkt = packet.Packet()
+        pkt.add_protocol(eth_reply)
+        pkt.add_protocol(arp_reply)
+        pkt.serialize()
+       
+        actions = [parser.OFPActionOutput(in_port)]
+        self.send_packet_out(datapath, actions, pkt.data, ofproto.OFPP_CONTROLLER)
+   
+@route('operations_log', '/logs/operations', methods=['GET'])
+def get_operations_log(self, req, **kwargs):
+    """Endpoint para obtener registros de operaciones desde MySQL"""
+    if not self.sdn_app.db_connection:
+        response = Response(
+            status=500,
+            content_type='application/json',
+            body=json.dumps({"error": "Base de datos no conectada"})
+        )
+        return self.set_cors_headers(response)
+
+    try:
+        with self.sdn_app.db_lock:  # Usar el lock para thread safety
+            with self.sdn_app.db_connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT operation_type, data, timestamp
+                    FROM operations
+                    ORDER BY timestamp DESC
+                    LIMIT 100
+                """)
+                result = cursor.fetchall()
+               
+                response = Response(
+                    content_type='application/json',
+                    body=json.dumps(result, default=str)  # Usar default=str para datetime
+                )
+                return self.set_cors_headers(response)
+               
+    except Exception as e:
+        self.sdn_app.logger.error(f"Error en GET /logs/operations: {str(e)}")
+        response = Response(
+            status=500,
+            content_type='application/json',
+            body=json.dumps({"error": f"Error de base de datos: {str(e)}"})
+        )
+        return self.set_cors_headers(response)
+    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
+    def port_status_handler(self, ev):
+        """Manejar cambios de estado de los puertos"""
+        msg = ev.msg
+        reason = msg.reason
+        port_no = msg.desc.port_no
+        dpid = msg.datapath.id
+        ofproto = msg.datapath.ofproto
+       
+        if reason == ofproto.OFPPR_ADD:
+            self.logger.info(f"Puerto {port_no} añadido en switch {dpid}")
+        elif reason == ofproto.OFPPR_DELETE:
+            self.logger.info(f"Puerto {port_no} eliminado en switch {dpid}")
+        elif reason == ofproto.OFPPR_MODIFY:
+            self.logger.info(f"Puerto {port_no} modificado en switch {dpid}")
+   
+    @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, CONFIG_DISPATCHER])
+    def state_change_handler(self, ev):
+        """Manejar cambios de estado del switch"""
+        datapath = ev.datapath
+        dpid = datapath.id
+       
+        if ev.state == MAIN_DISPATCHER:
+            if dpid not in self.datapaths:
+                self.logger.info(f"Switch {dpid} registrado")
+                self.datapaths[dpid] = datapath
+                self.mac_to_port.setdefault(dpid, {})
+       
+        elif ev.state == CONFIG_DISPATCHER:
+            if dpid in self.datapaths:
+                self.logger.info(f"Switch {dpid} desconectado")
+                del self.datapaths[dpid]
+                if dpid in self.mac_to_port:
+                    del self.mac_to_port[dpid]
+
+class GeantRestApi(ControllerBase):
+    def __init__(self, req, link, data, **config):
+        super(GeantRestApi, self).__init__(req, link, data, **config)
+        self.sdn_app = data['sdn_app']
+   
+    def set_cors_headers(self, response):
+        """Agregar encabezados CORS a todas las respuestas"""
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return response
+   
+    @route('options', '/{path:.*}', methods=['OPTIONS'])
+    def options_handler(self, req, **kwargs):
+        """Manejar solicitudes OPTIONS para CORS en cualquier ruta"""
+        response = Response(status=200)
+        return self.set_cors_headers(response)
+   
+    @route('switches', '/stats/switches', methods=['GET'])
+    def get_switches(self, req, **kwargs):
+        """Devuelve la lista de interruptores conectados"""
+        switch_list = list(self.sdn_app.datapaths.keys())
+        response = Response(
+            content_type='application/json',
+            charset='UTF-8',
+            body=json.dumps(switch_list)
+        )
+        return self.set_cors_headers(response)
+   
+    @route('flows', '/stats/flow/{dpid}', methods=['GET'])
+    def get_flows(self, req, **kwargs):
+        """Obtener flujos de un interruptor específico"""
+        dpid = int(kwargs['dpid'])
+        datapath = self.sdn_app.datapaths.get(dpid)
+       
+        if not datapath:
+            response = Response(
+                status=404,
+                body=json.dumps({"error": f"Switch con DPID {dpid} no encontrado"}),
+                content_type='application/json',
+                charset='UTF-8'
+            )
+            return self.set_cors_headers(response)
+       
+        # Aquí iría la lógica para obtener los flujos, pero por simplicidad devolvemos un mock
+        flows = [{"priority": 0, "match": {}, "actions": ["CONTROLLER"]}]
+        response = Response(
+            content_type='application/json',
+            charset='UTF-8',
+            body=json.dumps(flows)
+        )
+        return self.set_cors_headers(response)
+   
+    @route('routing_algorithm', '/routing/algorithm', methods=['GET', 'POST'])
+    def handle_routing_algorithm(self, req, **kwargs):
+        """Obtener o establecer el algoritmo de ruteo actual"""
+        if req.method == 'GET':
+            # Obtener el algoritmo actual
+            response = Response(
+                content_type='application/json',
+                body=json.dumps({
+                    'current_algorithm': self.sdn_app.routing_algorithm,
+                    'available_algorithms': self.sdn_app.routing_algorithms
+                })
+            )
+            return self.set_cors_headers(response)
+           
+        elif req.method == 'POST':
+            # Cambiar el algoritmo de ruteo
+            try:
+                body = json.loads(req.body)
+                algorithm = body.get('algorithm')
+               
+                if algorithm not in self.sdn_app.routing_algorithms:
+                    response = Response(
+                        status=400,
+                        content_type='application/json',
+                        body=json.dumps({
+                            'error': f'Algoritmo no válido. Opciones: {self.sdn_app.routing_algorithms}'
+                        })
+                    )
+                    return self.set_cors_headers(response)
+               
+                # Guardar algoritmo anterior para logging
+                previous_algorithm = self.sdn_app.routing_algorithm
+               
+                # Cambiar el algoritmo
+                self.sdn_app.set_routing_algorithm(algorithm)
+               
+                # Registrar en MySQL
+                self.sdn_app.log_operation('SET_ROUTING_ALGORITHM', {
+                    'algorithm': algorithm,
+                    'previous_algorithm': previous_algorithm
+                })
+               
+                # Si es Floyd-Warshall, recalcular
+                if algorithm == 'floyd_warshall':
+                    self.sdn_app.calculate_floyd_warshall()
+               
+                response = Response(
+                    content_type='application/json',
+                    body=json.dumps({
+                        'message': f'Algoritmo cambiado a {algorithm}',
+                        'current_algorithm': self.sdn_app.routing_algorithm
+                    })
+                )
+                return self.set_cors_headers(response)
+               
+            except Exception as e:
+                response = Response(
+                    status=400,
+                    content_type='application/json',
+                    body=json.dumps({'error': str(e)})
+                )
+                return self.set_cors_headers(response)
+   
+    @route('routing_path', '/routing/path/{src_dpid}/{dst_dpid}', methods=['GET'])
+    def get_routing_path(self, req, **kwargs):
+        """Obtener la ruta entre dos switches usando el algoritmo actual"""
+        try:
+            src_dpid = int(kwargs['src_dpid'])
+            dst_dpid = int(kwargs['dst_dpid'])
+           
+            if src_dpid not in self.sdn_app.topology or dst_dpid not in self.sdn_app.topology:
+                response = Response(
+                    status=404,
+                    content_type='application/json',
+                    body=json.dumps({'error': 'Switch no encontrado en la topología'})
+                )
+                return self.set_cors_headers(response)
+           
+            # Obtener la ruta según el algoritmo actual
+            if self.sdn_app.routing_algorithm == 'dijkstra':
+                path, distance = self.sdn_app.dijkstra_shortest_path(src_dpid, dst_dpid)
+            elif self.sdn_app.routing_algorithm == 'floyd_warshall':
+                path, distance = self.sdn_app.floyd_warshall_shortest_path(src_dpid, dst_dpid)
+            else:
+                # Para RR y WRR, obtener el primer salto
+                port = self.sdn_app.find_path_to_switch(src_dpid, dst_dpid)
+                if port is None:
+                    path, distance = None, float('infinity')
+                else:
+                    # En RR/WRR solo conocemos el primer salto
+                    path = [src_dpid, '?']  # Destino no es relevante en estos algoritmos
+                    distance = 0
+               
+            if not path:
+                response = Response(
+                    status=404,
+                    content_type='application/json',
+                    body=json.dumps({'error': 'No se encontró ruta entre los switches'})
+                )
+                return self.set_cors_headers(response)
+           
+            # Obtener detalles de la ruta (puertos, pesos)
+            route_details = []
+            if self.sdn_app.routing_algorithm in ['dijkstra', 'floyd_warshall']:
+                for i in range(len(path)-1):
+                    src = path[i]
+                    dst = path[i+1]
+                    weight = self.sdn_app.link_weights.get((src, dst), 1)
+                    port = self.sdn_app._get_port_mapping().get((src, dst), '?')
+                   
+                    route_details.append({
+                        'from_switch': src,
+                        'to_switch': dst,
+                        'weight': weight,
+                        'out_port': port
+                    })
+            else:
+                # Para RR y WRR solo mostramos el primer salto
+                port = self.sdn_app.find_path_to_switch(src_dpid, dst_dpid)
+                if port:
+                    route_details.append({
+                        'from_switch': src_dpid,
+                        'to_switch': 'Next hop',
+                        'weight': 'N/A',
+                        'out_port': port
+                    })
+           
+            response = Response(
+                content_type='application/json',
+                body=json.dumps({
+                    'algorithm': self.sdn_app.routing_algorithm,
+                    'path': path,
+                    'distance': distance,
+                    'hops': len(path)-1 if path else 0,
+                    'route_details': route_details
+                })
+            )
+            return self.set_cors_headers(response)
+           
+        except Exception as e:
+            response = Response(
+                status=400,
+                content_type='application/json',
+                body=json.dumps({'error': str(e)})
+            )
+            return self.set_cors_headers(response)
+   
+    @route('routing_comparison', '/routing/compare/{src_dpid}/{dst_dpid}', methods=['GET'])
+    def compare_routing_algorithms(self, req, **kwargs):
+        """Comparar resultados de ambos algoritmos para una ruta específica"""
+        try:
+            src_dpid = int(kwargs['src_dpid'])
+            dst_dpid = int(kwargs['dst_dpid'])
+           
+            if src_dpid not in self.sdn_app.topology or dst_dpid not in self.sdn_app.topology:
+                response = Response(
+                    status=404,
+                    content_type='application/json',
+                    body=json.dumps({'error': 'Switch no encontrado en la topología'})
+                )
+                return self.set_cors_headers(response)
+           
+            # Obtener ruta con Dijkstra
+            dijkstra_path, dijkstra_distance = self.sdn_app.dijkstra_shortest_path(src_dpid, dst_dpid)
+           
+            # Obtener ruta con Floyd-Warshall
+            fw_path, fw_distance = self.sdn_app.floyd_warshall_shortest_path(src_dpid, dst_dpid)
+           
+            response_data = {
+                'source': src_dpid,
+                'destination': dst_dpid,
+                'dijkstra': {
+                    'path': dijkstra_path,
+                    'distance': dijkstra_distance,
+                    'hops': len(dijkstra_path)-1 if dijkstra_path else None
+                },
+                'floyd_warshall': {
+                    'path': fw_path,
+                    'distance': fw_distance,
+                    'hops': len(fw_path)-1 if fw_path else None
+                },
+                'same_path': dijkstra_path == fw_path
+            }
+           
+            response = Response(
+                content_type='application/json',
+                body=json.dumps(response_data)
+            )
+            return self.set_cors_headers(response)
+           
+        except Exception as e:
+            response = Response(
+                status=400,
+                content_type='application/json',
+                body=json.dumps({'error': str(e)})
+            )
+            return self.set_cors_headers(response)
+   
+    @route('flowentry', '/stats/flowentry/add', methods=['POST'])
+    def add_flow_entry(self, req, **kwargs):
+        """Añadir un flujo a un switch"""
+        try:
+            body = json.loads(req.body)
+        except Exception as e:
+            response = Response(
+                status=400,
+                body=json.dumps({"error": f"JSON no válido: {str(e)}"}),
+                content_type='application/json',
+                charset='UTF-8'
+            )
+            return self.set_cors_headers(response)
+       
+        # Obtener identificación de ruta de datos
+        dpid = body.get("dpid")
+        if dpid is None:
+            response = Response(
+                status=400,
+                body=json.dumps({"error": "Falta el parámetro dpid"}),
+                content_type='application/json',
+                charset='UTF-8'
+            )
+            return self.set_cors_headers(response)
+       
+        # Convertir dpid a entero si es necesario
+        if isinstance(dpid, str):
+            try:
+                dpid = int(dpid)
+            except ValueError:
+                response = Response(
+                    status=400,
+                    body=json.dumps({"error": "dpid debe ser un entero"}),
+                    content_type='application/json',
+                    charset='UTF-8'
+                )
+                return self.set_cors_headers(response)
+       
+        datapath = self.sdn_app.datapaths.get(dpid)
+        if not datapath:
+            response = Response(
+                status=404,
+                body=json.dumps({"error": f"Switch con DPID {dpid} no encontrado"}),
+                content_type='application/json',
+                charset='UTF-8'
+            )
+            return self.set_cors_headers(response)
+       
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+       
+        # Construir el partido con los campos proporcionados
+        match_fields = body.get("match", {})
+       
+        # Asegurar que los campos de match sean válidos
+        valid_match = {}
+        for key, value in match_fields.items():
+            if value is not None and value != "":
+                # Convertir valores a los tipos esperados
+                if key == 'in_port':
+                    valid_match[key] = int(value)
+                else:
+                    valid_match[key] = value
+       
+        # Agregar eth_type si se están usando campos IP
+        if ("ipv4_src" in valid_match or "ipv4_dst" in valid_match) and "eth_type" not in valid_match:
+            valid_match["eth_type"] = 0x0800  # IPv4
+       
+        # Agregar eth_type si están usando campos TCP
+        if ("tcp_src" in valid_match or "tcp_dst" in valid_match) and "ip_proto" not in valid_match:
+            valid_match["eth_type"] = 0x0800  # IPv4
+            valid_match["ip_proto"] = 6  # TCP
+       
+        try:
+            match = parser.OFPMatch(**valid_match)
+        except Exception as e:
+            response = Response(
+                status=400,
+                content_type='application/json',
+                body=json.dumps({"error": f"Campos de coincidencia no válidos: {str(e)}"}),
+                charset='UTF-8'
+            )
+            return self.set_cors_headers(response)
+       
+        # Procesar acciones
+        actions = []
+        action_list = body.get("actions", [])
+        for action in action_list:
+            action_type = action.get("type")
+            if action_type == "OUTPUT":
+                port = action.get("port")
+                if port:
+                    try:
+                        port_num = int(port)
+                        actions.append(parser.OFPActionOutput(port_num))
+                    except ValueError:
+                        response = Response(
+                            status=400,
+                            body=json.dumps({"error": "El puerto debe ser un entero"}),
+                            content_type='application/json',
+                            charset='UTF-8'
+                        )
+                        return self.set_cors_headers(response)
+       
+        # Si no hay acciones, se interpreta como DROP
+        if not actions:
+            actions = []  # Arreglo vacío para DROP
+       
+        # Obtener prioridad o establecer valor por defecto
+        priority = int(body.get("priority", 1))
+       
+        # Añadir el flujo
+        self.sdn_app.add_flow(datapath, priority, match, actions)
+       
+        # Registrar en MySQL
+        self.sdn_app.log_flow_rule('POST', dpid, {
+            'match': valid_match,
+            'actions': action_list,
+            'priority': priority
+        })
+       
+        response = Response(
+            content_type='application/json',
+            charset='UTF-8',
+            body=json.dumps({"message": "Flujo añadido con éxito", "dpid": dpid})
+        )
+        return self.set_cors_headers(response)
+   
+    @route('flowentry_modify', '/stats/flowentry/modify', methods=['POST'])
+    def modify_flow_entry(self, req, **kwargs):
+        """Modificar un flujo existente"""
+        try:
+            body = json.loads(req.body)
+        except Exception as e:
+            response = Response(
+                status=400,
+                body=json.dumps({"error": f"JSON no válido: {str(e)}"}),
+                content_type='application/json',
+                charset='UTF-8'
+            )
+            return self.set_cors_headers(response)
+       
+        dpid = body.get("dpid")
+        if dpid is None:
+            response = Response(
+                status=400,
+                body=json.dumps({"error": "Falta el parámetro dpid"}),
+                content_type='application/json',
+                charset='UTF-8'
+            )
+            return self.set_cors_headers(response)
+       
+        if isinstance(dpid, str):
+            try:
+                dpid = int(dpid)
+            except ValueError:
+                response = Response(
+                    status=400,
+                    body=json.dumps({"error": "dpid debe ser un entero"}),
+                    content_type='application/json',
+                    charset='UTF-8'
+                )
+                return self.set_cors_headers(response)
+       
+        datapath = self.sdn_app.datapaths.get(dpid)
+        if not datapath:
+            response = Response(
+                status=404,
+                body=json.dumps({"error": f"Switch con DPID {dpid} no encontrado"}),
+                content_type='application/json',
+                charset='UTF-8'
+            )
+            return self.set_cors_headers(response)
+       
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+       
+        match_fields = body.get("match", {})
+        valid_match = {}
+        for key, value in match_fields.items():
+            if value is not None and value != "":
+                if key == 'in_port':
+                    valid_match[key] = int(value)
+                else:
+                    valid_match[key] = value
+       
+        if ("ipv4_src" in valid_match or "ipv4_dst" in valid_match) and "eth_type" not in valid_match:
+            valid_match["eth_type"] = 0x0800  # IPv4
+       
+        if ("tcp_src" in valid_match or "tcp_dst" in valid_match) and "ip_proto" not in valid_match:
+            valid_match["eth_type"] = 0x0800  # IPv4
+            valid_match["ip_proto"] = 6  # TCP
+       
+        try:
+            match = parser.OFPMatch(**valid_match)
+        except Exception as e:
+            response = Response(
+                status=400,
+                content_type='application/json',
+                body=json.dumps({"error": f"Campos de coincidencia no válidos: {str(e)}"}),
+                charset='UTF-8'
+            )
+            return self.set_cors_headers(response)
+       
+        actions = []
+        action_list = body.get("actions", [])
+        for action in action_list:
+            action_type = action.get("type")
+            if action_type == "OUTPUT":
+                port = action.get("port")
+                if port:
+                    try:
+                        port_num = int(port)
+                        actions.append(parser.OFPActionOutput(port_num))
+                    except ValueError:
+                        response = Response(
+                            status=400,
+                            body=json.dumps({"error": "El puerto debe ser un entero"}),
+                            content_type='application/json',
+                            charset='UTF-8'
+                        )
+                        return self.set_cors_headers(response)
+       
+        priority = int(body.get("priority", 1))
+       
+        # Crear el mensaje OFPFlowMod para modificar el flujo
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            command=ofproto.OFPFC_MODIFY,  # Comando para modificar el flujo
+            priority=priority,
+            match=match,
+            instructions=[parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        )
+        datapath.send_msg(mod)
+       
+        # Registrar en MySQL
+        self.sdn_app.log_flow_rule('PUT', dpid, {
+            'match': valid_match,
+            'actions': action_list,
+            'priority': priority
+        })
+       
+        response = Response(
+            content_type='application/json',
+            charset='UTF-8',
+            body=json.dumps({"message": "Flujo modificado con éxito", "dpid": dpid})
+        )
+        return self.set_cors_headers(response)
+   
+    @route('flowentry_delete', '/stats/flowentry/delete', methods=['POST'])
+    def delete_flow_entry(self, req, **kwargs):
+        """Eliminar un flujo existente"""
+        try:
+            body = json.loads(req.body)
+        except Exception as e:
+            response = Response(
+                status=400,
+                body=json.dumps({"error": f"JSON no válido: {str(e)}"}),
+                content_type='application/json',
+                charset='UTF-8'
+            )
+            return self.set_cors_headers(response)
+       
+        dpid = body.get("dpid")
+        if dpid is None:
+            response = Response(
+                status=400,
+                body=json.dumps({"error": "Falta el parámetro dpid"}),
+                content_type='application/json',
+                charset='UTF-8'
+            )
+            return self.set_cors_headers(response)
+       
+        if isinstance(dpid, str):
+            try:
+                dpid = int(dpid)
+            except ValueError:
+                response = Response(
+                    status=400,
+                    body=json.dumps({"error": "dpid debe ser un entero"}),
+                    content_type='application/json',
+                    charset='UTF-8'
+                )
+                return self.set_cors_headers(response)
+       
+        datapath = self.sdn_app.datapaths.get(dpid)
+        if not datapath:
+            response = Response(
+                status=404,
+                body=json.dumps({"error": f"Switch con DPID {dpid} no encontrado"}),
+                content_type='application/json',
+                charset='UTF-8'
+            )
+            return self.set_cors_headers(response)
+       
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+       
+        match_fields = body.get("match", {})
+        valid_match = {}
+        for key, value in match_fields.items():
+            if value is not None and value != "":
+                if key == 'in_port':
+                    valid_match[key] = int(value)
+                else:
+                    valid_match[key] = value
+       
+        if ("ipv4_src" in valid_match or "ipv4_dst" in valid_match) and "eth_type" not in valid_match:
+            valid_match["eth_type"] = 0x0800  # IPv4
+       
+        if ("tcp_src" in valid_match or "tcp_dst" in valid_match) and "ip_proto" not in valid_match:
+            valid_match["eth_type"] = 0x0800  # IPv4
+            valid_match["ip_proto"] = 6  # TCP
+       
+        try:
+            match = parser.OFPMatch(**valid_match)
+        except Exception as e:
+            response = Response(
+                status=400,
+                content_type='application/json',
+                body=json.dumps({"error": f"Campos de coincidencia no válidos: {str(e)}"}),
+                charset='UTF-8'
+            )
+            return self.set_cors_headers(response)
+       
+        priority = int(body.get("priority", 1))
+       
+        # Crear el mensaje OFPFlowMod para eliminar el flujo
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            command=ofproto.OFPFC_DELETE,  # Comando para eliminar el flujo
+            priority=priority,
+            match=match,
+            out_port=ofproto.OFPP_ANY,
+            out_group=ofproto.OFPG_ANY
+        )
+        datapath.send_msg(mod)
+       
+        # Registrar en MySQL
+        self.sdn_app.log_flow_rule('DELETE', dpid, {
+            'match': valid_match,
+            'priority': priority
+        })
+       
+        response = Response(
+            content_type='application/json',
+            charset='UTF-8',
+            body=json.dumps({"message": "Flujo eliminado con éxito", "dpid": dpid})
+        )
+        return self.set_cors_headers(response)
+
+    @route('vlc_hosts', '/vlc/hosts', methods=['GET', 'POST'])
+    def handle_vlc_hosts(self, req, **kwargs):
+        """Obtener o establecer los hosts VLC (1-3 hosts permitidos)"""
+        if req.method == 'GET':
+            # Obtener hosts VLC actuales
+            response = Response(
+                content_type='application/json',
+                body=json.dumps({
+                    'vlc_hosts': self.sdn_app.vlc_servers
+                })
+            )
+            return self.set_cors_headers(response)
+           
+        elif req.method == 'POST':
+            # Establecer nuevos hosts VLC
+            try:
+                body = json.loads(req.body)
+                hosts = body.get('vlc_hosts', [])
+               
+                # Validar que hay entre 1 y 3 hosts
+                if len(hosts) < 1 or len(hosts) > 3:
+                    response = Response(
+                        status=400,
+                        content_type='application/json',
+                        body=json.dumps({
+                            'error': 'Debe especificar entre 1 y 3 hosts VLC'
+                        })
+                    )
+                    return self.set_cors_headers(response)
+               
+                # Validar formato de hosts (hX_Y donde X es 1-43, Y es 1-2)
+                valid_hosts = []
+                for host in hosts:
+                    if not re.match(r'^h\d{1,2}_[12]$', host):
+                        response = Response(
+                            status=400,
+                            content_type='application/json',
+                            body=json.dumps({
+                                'error': f'Formato de host inválido: {host}. Debe ser hX_Y (ej: h1_1)'
+                            })
+                        )
+                        return self.set_cors_headers(response)
+                   
+                    # Validar rango numérico
+                    switch_id = int(host.split('_')[0][1:])
+                    host_num = int(host.split('_')[1])
+                   
+                    if switch_id < 1 or switch_id > 43 or host_num < 1 or host_num > 2:
+                        response = Response(
+                            status=400,
+                            content_type='application/json',
+                            body=json.dumps({
+                                'error': f'Host {host} no existe en la topología (rango válido: h1_1 a h43_2)'
+                            })
+                        )
+                        return self.set_cors_headers(response)
+                   
+                    valid_hosts.append(host)
+               
+                # Guardar hosts anteriores para logging
+                previous_hosts = self.sdn_app.vlc_servers
+               
+                # Actualizar lista de hosts VLC
+                self.sdn_app.vlc_servers = valid_hosts
+                self.sdn_app.logger.info(f"Hosts VLC actualizados: {valid_hosts}")
+               
+                # Registrar en MySQL
+                self.sdn_app.log_operation('SET_VLC_HOSTS', {
+                    'vlc_hosts': valid_hosts,
+                    'previous_vlc_hosts': previous_hosts
+                })
+               
+                response = Response(
+                    content_type='application/json',
+                    body=json.dumps({
+                        'message': 'Hosts VLC configurados correctamente',
+                        'vlc_hosts': valid_hosts
+                    })
+                )
+                return self.set_cors_headers(response)
+               
+            except Exception as e:
+                response = Response(
+                    status=400,
+                    content_type='application/json',
+                    body=json.dumps({'error': str(e)})
+                )
+                return self.set_cors_headers(response)
